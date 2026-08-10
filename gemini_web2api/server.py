@@ -99,21 +99,22 @@ class GeminiHandler(BaseHTTPRequestHandler):
             if self.path.startswith("/v1") and not self._authorized():
                 self.send_json({"error": {"message": "invalid api key"}}, 401)
                 return
-            if self.path == "/v1/models":
+            path = self.path.split("?", 1)[0]
+            if path == "/v1/models":
                 self.send_json({"object": "list", "data": [
                     {"id": n, "object": "model", "created": 1700000000,
                      "owned_by": "google", "description": c["desc"]}
                     for n, c in MODELS.items()
                 ]})
-            elif self.path.startswith("/v1beta/models"):
+            elif path.startswith("/v1beta/models"):
                 self.send_json({"models": [
                     {"name": f"models/{n}", "displayName": n, "description": c["desc"],
                      "supportedGenerationMethods": ["generateContent", "streamGenerateContent"]}
                     for n, c in MODELS.items()
                 ]})
-            elif self.path == "/":
+            elif path == "/":
                 self.send_json({"status": "ok", "version": __version__, "models": list(MODELS.keys())})
-            elif self.path in ("/status", "/v1/proxy/status"):
+            elif path in ("/status", "/v1/proxy/status"):
                 self.send_json({"status": "ok", "version": __version__, "proxy_pool": POOL.status()})
             else:
                 self.send_json({"error": "not found"}, 404)
@@ -127,13 +128,14 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 return
             length = int(self.headers.get("Content-Length", 0))
             body = self.rfile.read(length) if length else b""
-            if self.path == "/v1/chat/completions":
+            path = self.path.split("?", 1)[0]
+            if path == "/v1/chat/completions":
                 self._handle_chat(body)
-            elif self.path == "/v1/responses":
+            elif path == "/v1/responses":
                 self._handle_responses(body)
-            elif ":generateContent" in self.path:
+            elif ":generateContent" in path:
                 self._handle_google_generate(body, stream=False)
-            elif ":streamGenerateContent" in self.path:
+            elif ":streamGenerateContent" in path:
                 self._handle_google_generate(body, stream=True)
             else:
                 self.send_json({"error": "not found"}, 404)
