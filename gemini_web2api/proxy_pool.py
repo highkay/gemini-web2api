@@ -47,6 +47,7 @@ class ProxyPool:
         self._state: dict[Optional[str], dict[str, Any]] = {}
         self._current: Optional[str] = None
         self._configured = False
+        self._dynamic_exits: set = set()
 
     def configure_from_config(self) -> None:
         """Load proxy list from CONFIG. Safe to call multiple times."""
@@ -95,6 +96,9 @@ class ProxyPool:
                 "cooldown_sec": float(rotate.get("cooldown_sec", 300)),
                 "fail_threshold": int(rotate.get("fail_threshold", 1)),
                 "probe_on_start": bool(rotate.get("probe_on_start", False)),
+            }
+            self._dynamic_exits = {
+                _normalize_proxy(p) for p in (rotate.get("dynamic_exits") or [])
             }
 
         labels = ", ".join(_proxy_label(p) for p in ordered) or "direct"
@@ -202,7 +206,7 @@ class ProxyPool:
                 st["failures"] = int(st.get("failures") or 0) + 1
                 st["last_fail"] = now
                 st["last_error"] = reason[:300]
-                if st["fails"] >= self._fail_threshold():
+                if st["fails"] >= self._fail_threshold() and proxy not in self._dynamic_exits:
                     st["cooldown_until"] = now + self._cooldown_sec()
                     log(
                         f"Proxy cooldown {_proxy_label(proxy)} for {int(self._cooldown_sec())}s "

@@ -105,8 +105,10 @@ class ProxyPoolTest(unittest.TestCase):
     """S2: proxy pool rotation/cooldown/success-reset behavior."""
 
     def setUp(self):
-        CONFIG["proxies"] = ["socks5://exit-a:1080", "socks5://exit-b:1080"]
+        CONFIG["proxies"] = []
         CONFIG["proxy_rotate"] = {"enabled": True, "cooldown_sec": 5, "fail_threshold": 1}
+        POOL.configure_from_config()
+        CONFIG["proxies"] = ["socks5://exit-a:1080", "socks5://exit-b:1080"]
         POOL.configure_from_config()
 
     def test_configure_loads_all_exits(self):
@@ -165,3 +167,32 @@ class BardErrorDetectionTest(unittest.TestCase):
         from gemini_web2api.gemini import extract_response_text
         with self.assertRaisesRegex(RuntimeError, "1060"):
             extract_response_text(self._json_error_payload())
+
+
+class DynamicExitTest(unittest.TestCase):
+    """S5: dynamic exits (rotate IP per request) must not be cooled down on failure."""
+
+    def setUp(self):
+        CONFIG["proxies"] = ["http://user:pass@127.0.0.1:2260", "socks5://exit-b:1080"]
+        CONFIG["proxy_rotate"] = {
+            "enabled": True,
+            "cooldown_sec": 300,
+            "fail_threshold": 1,
+            "probe_on_start": False,
+            "dynamic_exits": ["http://user:pass@127.0.0.1:2260"],
+        }
+        POOL.configure_from_config()
+
+    def test_dynamic_exit_not_cooled_on_failure(self):
+        POOL.mark_failure("http://user:pass@127.0.0.1:2260", "BardErrorInfo [1060]")
+        status = POOL.status()
+        dyn = [e for e in status["exits"] if e["proxy"] == "http://user:pass@127.0.0.1:2260"][0]
+        self.assertTrue(dyn["available"], "dynamic exit must stay available (IP rotates per request)")
+        self.assertEqual(dyn["cooldown_remaining_sec"], 0)
+        self.assertEqual(status["current"], "socks5://exit-b:1080", "still rotates to next exit")
+
+    def test_dynamic_exit_candidates_include_it_immediately(self):
+        POOL.mark_failure("http://user:pass@127.0.0.1:2260", "rate limited")
+        candidates = POOL.candidates()
+        self.assertIn("http://user:pass@127.0.0.1:2260", candidates,
+                      "dynamic exit returns to rotation immediately (new IP next request)")
