@@ -222,11 +222,18 @@ def _extract_texts_from_line(line: str) -> list:
         return []
 
 
-def extract_response_text(raw: str) -> str:
-    """Parse full response to get final text."""
-    bard_err = re.search(r'BardErrorInfo\s*\[(\d+)\]', raw)
+_BARD_ERR_RE = re.compile(r'BardErrorInfo[^\d]*\[(\d+)\]')
+
+
+def _raise_bard_error(raw: str):
+    bard_err = _BARD_ERR_RE.search(raw)
     if bard_err:
         raise RuntimeError(f"Gemini upstream rejected request: BardErrorInfo [{bard_err.group(1)}]")
+
+
+def extract_response_text(raw: str) -> str:
+    """Parse full response to get final text."""
+    _raise_bard_error(raw)
     last_text = ""
     for line in raw.split("\n"):
         for t in _extract_texts_from_line(line):
@@ -411,11 +418,7 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
                 for chunk in resp.iter_text():
                     buf += chunk
                     if "BardErrorInfo" in buf:
-                        bard_err = re.search(r'BardErrorInfo\s*\[(\d+)\]', buf)
-                        if bard_err:
-                            raise RuntimeError(
-                                f"Gemini upstream rejected request: BardErrorInfo [{bard_err.group(1)}]"
-                            )
+                        _raise_bard_error(buf)
                     # Early captcha body detection
                     if len(buf) < 500 and is_block_response(200, None, buf):
                         raise BlockedUpstreamError("blocked body (captcha/sorry)")

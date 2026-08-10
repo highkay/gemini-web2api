@@ -149,3 +149,19 @@ class ConfigMergeTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class BardErrorDetectionTest(unittest.TestCase):
+    """S4: JSON-form BardErrorInfo must be detected (upstream regex misses it)."""
+
+    def _json_error_payload(self):
+        return (
+            ")]}'\n\n121\n"
+            '[["wrb.fr",null,null,null,null,[9,null,'
+            '[["type.googleapis.com/assistant.boq.bard.application.BardErrorInfo",[1060]]]]]]\n'
+        )
+
+    def test_json_bard_error_raises(self):
+        from gemini_web2api.gemini import extract_response_text
+        with self.assertRaisesRegex(RuntimeError, "1060"):
+            extract_response_text(self._json_error_payload())
