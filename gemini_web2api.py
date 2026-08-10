@@ -51,13 +51,15 @@ DEFAULT_CONFIG = {
     "retry_attempts": 3,
     "retry_delay_sec": 2,
     "request_timeout_sec": 180,
-    "gemini_bl": "boq_assistant-bard-web-server_20260525.09_p0",
+    "gemini_bl": "boq_assistant-bard-web-server_20260716.08_p0",
     "auth_user": None,
     "xsrf_token": None,
-    "default_model": "gemini-3.5-flash",
+    "default_model": "gemini-3.6-flash",
     "log_requests": True,
     "cookie_file": None,
     "proxy": None,
+    "api_keys": [],
+    "temporary_chats": False,
 }
 
 CONFIG = dict(DEFAULT_CONFIG)
@@ -67,9 +69,13 @@ CONFIG = dict(DEFAULT_CONFIG)
 #   1=FAST, 2=THINKING, 3=PRO, 4=AUTO, 5=FAST_DYNAMIC_THINKING, 6=FLASH_LITE
 
 MODELS = {
+    "gemini-3.6-flash": {
+        "mode": 1, "think": 4,
+        "desc": "Latest all-around model (Gemini 3.6 Flash)",
+    },
     "gemini-3.5-flash": {
         "mode": 1, "think": 4,
-        "desc": "Fast general-purpose model",
+        "desc": "Alias for gemini-3.6-flash (backend upgraded)",
     },
     "gemini-3.5-flash-thinking": {
         "mode": 2, "think": 0,
@@ -139,6 +145,49 @@ def account_prefix() -> str:
     return f"/u/{auth_user}"
 
 
+def apply_chat_persistence_flags(inner: list) -> None:
+    """Apply Gemini Web persistence flags to an outgoing request payload."""
+    if CONFIG.get("temporary_chats", False):
+        inner[41] = [1]
+        inner[45] = 1
+    else:
+        inner[41] = [2]
+
+
+def fetch_latest_bl() -> str | None:
+    """Fetch the latest gemini_bl from gemini.google.com page."""
+    try:
+        req = urllib.request.Request(
+            "https://gemini.google.com/app",
+            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"})
+        ctx = ssl.create_default_context()
+        proxy = CONFIG.get("proxy")
+        if proxy:
+            opener = urllib.request.build_opener(
+                urllib.request.ProxyHandler({"http": proxy, "https": proxy}),
+                urllib.request.HTTPSHandler(context=ctx))
+            resp = opener.open(req, timeout=15)
+        else:
+            resp = urllib.request.urlopen(req, context=ctx, timeout=15)
+        html = resp.read().decode("utf-8", errors="replace")
+        m = re.search(r'(boq_assistant-bard-web-server_\d+\.\d+_p\d+)', html)
+        if m:
+            return m.group(1)
+    except Exception as e:
+        log(f"BL auto-update fetch failed: {e}")
+    return None
+
+
+def update_bl_if_needed() -> bool:
+    """Attempt to fetch and update gemini_bl. Returns True if updated."""
+    new_bl = fetch_latest_bl()
+    if new_bl and new_bl != CONFIG["gemini_bl"]:
+        log(f"BL auto-updated: {CONFIG['gemini_bl']} -> {new_bl}")
+        CONFIG["gemini_bl"] = new_bl
+        return True
+    return False
+
+
 # ─── Gemini Protocol ─────────────────────────────────────────────────────────
 
 def gemini_stream_generate(prompt: str, model_id: int, think_mode: int) -> str:
@@ -155,7 +204,7 @@ def gemini_stream_generate(prompt: str, model_id: int, think_mode: int) -> str:
     inner[18] = 0
     inner[27] = 1
     inner[30] = [4]
-    inner[41] = [2]
+    apply_chat_persistence_flags(inner)
     inner[53] = 0
     inner[59] = str(uuid.uuid4())
     inner[61] = []
@@ -205,6 +254,21 @@ def gemini_stream_generate(prompt: str, model_id: int, think_mode: int) -> str:
             else:
                 resp = urllib.request.urlopen(req, context=ctx, timeout=CONFIG["request_timeout_sec"])
             return resp.read().decode("utf-8", errors="replace")
+        except urllib.error.HTTPError as e:
+            if e.code == 405 and update_bl_if_needed():
+                reqid = int(time.time()) % 1000000
+                url = (
+                    f"https://gemini.google.com{prefix}/_/BardChatUi/data/"
+                    "assistant.lamda.BardFrontendService/StreamGenerate"
+                    f"?bl={CONFIG['gemini_bl']}&hl=en&_reqid={reqid}&rt=c"
+                )
+                log("Retrying with updated BL...")
+                last_err = e
+                continue
+            last_err = e
+            if attempt < CONFIG["retry_attempts"] - 1:
+                log(f"Retry {attempt+1}/{CONFIG['retry_attempts']}: {e}")
+                time.sleep(CONFIG["retry_delay_sec"])
         except Exception as e:
             last_err = e
             if attempt < CONFIG["retry_attempts"] - 1:
@@ -227,7 +291,7 @@ def gemini_stream_generate_iter(prompt: str, model_id: int, think_mode: int):
     inner[18] = 0
     inner[27] = 1
     inner[30] = [4]
-    inner[41] = [2]
+    apply_chat_persistence_flags(inner)
     inner[53] = 0
     inner[59] = str(uuid.uuid4())
     inner[61] = []
@@ -274,45 +338,66 @@ def gemini_stream_generate_iter(prompt: str, model_id: int, think_mode: int):
     prev_text = ""
     transport = httpx.HTTPTransport(proxy=proxy) if proxy else None
     with httpx.Client(transport=transport, timeout=CONFIG["request_timeout_sec"], verify=True) as client:
-        with client.stream("POST", url, content=body, headers=headers) as resp:
-            buf = ""
-            for chunk in resp.iter_text():
-                buf += chunk
-                while "\n" in buf:
-                    line, buf = buf.split("\n", 1)
-                    if '"wrb.fr"' not in line or len(line) < 200:
-                        continue
-                    try:
-                        arr = json.loads(line)
-                        inner_str = arr[0][2]
-                        if not inner_str or len(inner_str) < 50:
+        try:
+            with client.stream("POST", url, content=body, headers=headers) as resp:
+                resp.raise_for_status()
+                buf = ""
+                for chunk in resp.iter_text():
+                    buf += chunk
+                    if "BardErrorInfo" in buf:
+                        import re as _re
+                        m = _re.search(r'BardErrorInfo\s*\[(\d+)\]', buf)
+                        if m:
+                            raise RuntimeError(f"Gemini upstream rejected request: BardErrorInfo [{m.group(1)}]")
+                    while "\n" in buf:
+                        line, buf = buf.split("\n", 1)
+                        if '"wrb.fr"' not in line or len(line) < 200:
                             continue
-                        inner2 = json.loads(inner_str)
-                        if isinstance(inner2, list) and len(inner2) > 4 and inner2[4]:
-                            for part in inner2[4]:
-                                if isinstance(part, list) and len(part) > 1 and part[1] and isinstance(part[1], list):
-                                    for t in part[1]:
-                                        if isinstance(t, str) and len(t) > len(prev_text):
-                                            delta = t[len(prev_text):]
-                                            delta = clean_gemini_text(delta)
-                                            if delta:
-                                                yield delta
-                                            prev_text = t
-                    except (json.JSONDecodeError, IndexError, TypeError):
-                        pass
+                        try:
+                            arr = json.loads(line)
+                            inner_str = arr[0][2]
+                            if not inner_str or len(inner_str) < 50:
+                                continue
+                            inner2 = json.loads(inner_str)
+                            if isinstance(inner2, list) and len(inner2) > 4 and inner2[4]:
+                                for part in inner2[4]:
+                                    if isinstance(part, list) and len(part) > 1 and part[1] and isinstance(part[1], list):
+                                        for t in part[1]:
+                                            if isinstance(t, str) and len(t) > len(prev_text):
+                                                delta = t[len(prev_text):]
+                                                delta = clean_gemini_text(delta, strip=False)
+                                                if delta:
+                                                    yield delta
+                                                prev_text = t
+                        except (json.JSONDecodeError, IndexError, TypeError):
+                            pass
+        except Exception as e:
+            if HAS_HTTPX and hasattr(e, 'response') and getattr(e.response, 'status_code', 0) == 405:
+                if update_bl_if_needed():
+                    log("BL updated, falling back to non-streaming for this request")
+                    raw = gemini_stream_generate(prompt, model_id, think_mode)
+                    text = extract_response_text(raw)
+                    if text:
+                        yield text
+                    return
+            raise
 
 
-def clean_gemini_text(text: str) -> str:
+def clean_gemini_text(text: str, strip: bool = True) -> str:
     """Remove internal code execution artifacts."""
     text = re.sub(
         r'```(?:python|javascript|text)\?code_(?:reference|stdout)&code_event_index=\d+\n.*?```\n?',
         '', text, flags=re.DOTALL
     )
-    return text.strip()
+    return text.strip() if strip else text
 
 
 def extract_response_text(raw: str) -> str:
     """Parse StreamGenerate response to extract final text."""
+    import re as _re
+    bard_err = _re.search(r'BardErrorInfo\s*\[(\d+)\]', raw)
+    if bard_err:
+        raise RuntimeError(f"Gemini upstream rejected request: BardErrorInfo [{bard_err.group(1)}]")
     texts = []
     for line in raw.split("\n"):
         if '"wrb.fr"' not in line or len(line) < 200:
@@ -416,7 +501,8 @@ def parse_tool_calls(text: str) -> tuple:
 
 class GeminiHandler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
-        log(fmt % args)
+        client_ip = self.client_address[0] if self.client_address else "-"
+        log(f"{client_ip} {fmt % args}")
 
     def send_json(self, data, status=200):
         body = json.dumps(data, ensure_ascii=False).encode()
@@ -427,6 +513,25 @@ class GeminiHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _authorized(self):
+        keys = CONFIG.get("api_keys") or []
+        if not keys:
+            return True
+        # Authorization: Bearer <key>
+        auth = self.headers.get("Authorization", "")
+        if auth.startswith("Bearer ") and auth[7:] in keys:
+            return True
+        # header keys (OpenAI x-api-key / Google x-goog-api-key)
+        for h in ("x-api-key", "x-goog-api-key"):
+            if self.headers.get(h, "") in keys:
+                return True
+        # query param ?key= (Gemini CLI native style)
+        if "?" in self.path:
+            for pair in self.path.split("?", 1)[1].split("&"):
+                if pair.startswith("key=") and pair[4:] in keys:
+                    return True
+        return False
+
     def do_OPTIONS(self):
         self.send_response(204)
         self.send_header("Access-Control-Allow-Origin", "*")
@@ -436,6 +541,9 @@ class GeminiHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         try:
+            if self.path.startswith("/v1") and not self._authorized():
+                self.send_json({"error": {"message": "invalid api key"}}, 401)
+                return
             if self.path == "/v1/models":
                 self.send_json({"object": "list", "data": [
                     {"id": n, "object": "model", "created": 1700000000,
@@ -456,6 +564,9 @@ class GeminiHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         try:
+            if self.path.startswith("/v1") and not self._authorized():
+                self.send_json({"error": {"message": "invalid api key"}}, 401)
+                return
             length = int(self.headers.get("Content-Length", 0))
             body = self.rfile.read(length) if length else b""
             if self.path == "/v1/chat/completions":
@@ -520,6 +631,9 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 self.send_header("Cache-Control", "no-cache")
                 self.send_header("Access-Control-Allow-Origin", "*")
                 self.end_headers()
+                first_chunk = {"id": cid, "object": "chat.completion.chunk", "created": int(time.time()),
+                               "model": model_name, "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}]}
+                self.wfile.write(f"data: {json.dumps(first_chunk)}\n\n".encode())
                 for delta_text in gemini_stream_generate_iter(prompt, model_id, think_mode):
                     chunk = {"id": cid, "object": "chat.completion.chunk", "created": int(time.time()),
                              "model": model_name, "choices": [{"index": 0, "delta": {"content": delta_text}, "finish_reason": None}]}
@@ -650,19 +764,36 @@ class GeminiHandler(BaseHTTPRequestHandler):
             self.send_header("Cache-Control", "no-cache")
             self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
-            ev = {"type": "response.created", "response": {"id": rid, "object": "response", "status": "in_progress", "model": model_name, "output": []}}
-            self.wfile.write(f"event: response.created\ndata: {json.dumps(ev)}\n\n".encode())
-            for item in output:
+            seq = [0]
+
+            def emit(ev_type, **fields):
+                seq[0] += 1
+                ev = {"type": ev_type, "sequence_number": seq[0], **fields}
+                self.wfile.write(f"event: {ev_type}\ndata: {json.dumps(ev)}\n\n".encode())
+
+            usage = {"input_tokens": len(prompt)//4, "output_tokens": len(text)//4, "total_tokens": (len(prompt)+len(text))//4}
+            base_resp = {"id": rid, "object": "response", "created_at": int(time.time()), "model": model_name}
+            emit("response.created", response={**base_resp, "status": "in_progress", "output": [], "usage": None})
+            emit("response.in_progress", response={**base_resp, "status": "in_progress", "output": [], "usage": None})
+            for oi, item in enumerate(output):
                 if item["type"] == "function_call":
-                    ev = {"type": "response.function_call_arguments.done", "item_id": item["id"], "call_id": item["call_id"], "name": item["name"], "arguments": item["arguments"]}
-                    self.wfile.write(f"event: response.function_call_arguments.done\ndata: {json.dumps(ev)}\n\n".encode())
+                    pending = {"type": "function_call", "id": item["id"], "call_id": item["call_id"],
+                               "name": item["name"], "arguments": "", "status": "in_progress"}
+                    emit("response.output_item.added", output_index=oi, item=pending)
+                    emit("response.function_call_arguments.delta", item_id=item["id"], output_index=oi, delta=item["arguments"])
+                    emit("response.function_call_arguments.done", item_id=item["id"], output_index=oi, arguments=item["arguments"])
+                    emit("response.output_item.done", output_index=oi, item=item)
                 elif item["type"] == "message":
+                    pending = {"type": "message", "id": item["id"], "role": "assistant", "status": "in_progress", "content": []}
+                    emit("response.output_item.added", output_index=oi, item=pending)
                     for ci, cp in enumerate(item["content"]):
-                        ev = {"type": "response.output_text.done", "item_id": item["id"], "content_index": ci, "text": cp["text"]}
-                        self.wfile.write(f"event: response.output_text.done\ndata: {json.dumps(ev)}\n\n".encode())
-            resp_obj = {"id": rid, "object": "response", "status": "completed", "model": model_name, "output": output,
-                        "usage": {"input_tokens": len(prompt)//4, "output_tokens": len(text)//4, "total_tokens": (len(prompt)+len(text))//4}}
-            self.wfile.write(f"event: response.completed\ndata: {json.dumps({'type': 'response.completed', 'response': resp_obj})}\n\n".encode())
+                        emit("response.content_part.added", item_id=item["id"], output_index=oi, content_index=ci,
+                             part={"type": "output_text", "text": "", "annotations": []})
+                        emit("response.output_text.delta", item_id=item["id"], output_index=oi, content_index=ci, delta=cp["text"])
+                        emit("response.output_text.done", item_id=item["id"], output_index=oi, content_index=ci, text=cp["text"])
+                        emit("response.content_part.done", item_id=item["id"], output_index=oi, content_index=ci, part=cp)
+                    emit("response.output_item.done", output_index=oi, item=item)
+            emit("response.completed", response={**base_resp, "status": "completed", "output": output, "usage": usage})
             self.wfile.flush()
         else:
             self.send_json({"id": rid, "object": "response", "created_at": int(time.time()), "status": "completed",
@@ -799,6 +930,10 @@ def main():
     if args.proxy:
         CONFIG["proxy"] = args.proxy
 
+    new_bl = fetch_latest_bl()
+    if new_bl:
+        CONFIG["gemini_bl"] = new_bl
+
     class ThreadedServer(ThreadingMixIn, HTTPServer):
         daemon_threads = True
         allow_reuse_address = True
@@ -812,6 +947,8 @@ def main():
     print(f"  Cookie:    {'yes (' + CONFIG['cookie_file'] + ')' if CONFIG.get('cookie_file') else 'none (anonymous)'}")
     print(f"  Proxy:     {CONFIG.get('proxy') or 'none (uses system env HTTP_PROXY/HTTPS_PROXY)'}")
     print(f"  Retry:     {CONFIG['retry_attempts']}x / {CONFIG['retry_delay_sec']}s")
+    print(f"  BL:        {CONFIG['gemini_bl']}")
+    print(f"  Temporary: {'yes' if CONFIG.get('temporary_chats', False) else 'no'}")
     print()
     try:
         server.serve_forever()

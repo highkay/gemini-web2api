@@ -6,24 +6,25 @@
 
 [中文文档](README_CN.md)
 
-Convert Google Gemini's web interface into an OpenAI-compatible API. Zero authentication, zero cost, cross-platform.
+Convert Google Gemini's web interface into an OpenAI-compatible API. Zero cost, cross-platform, single file.
 
 ## Features
 
 - **Optional API Keys**: no auth when `api_keys` is empty, OpenAI-style Bearer auth when configured
 - **OpenAI Compatible**: Drop-in replacement for `/v1/chat/completions` and `/v1/models`
 - **Tool Calling**: Full function calling support (OpenAI format)
-- **Multiple Models**: Flash, Flash Thinking (20k+ char output), Pro, Auto, Lite
+- **Multiple Models**: Flash (3.6), Extended Thinking (20k+ char output), Pro, Auto, Lite
 - **Thinking Depth**: Adjustable via `@think=N` suffix (0=deepest, 4=shallowest)
 - **Web Search**: Built-in internet access (Gemini's native search)
-- **Cross-Platform**: Pure Python, no dependencies beyond stdlib
-- **Streaming**: SSE streaming support
+- **Cross-Platform**: Pure Python, single optional dependency (`httpx` for streaming)
+- **Streaming**: SSE streaming support via `httpx`
 - **Codex CLI**: Responses API (`/v1/responses`) for OpenAI Codex integration
 - **Gemini CLI**: Google native API (`/v1beta/models`) for Gemini CLI compatibility
 
 ## Quick Start
 
 ```bash
+pip install httpx
 python gemini_web2api.py
 ```
 
@@ -41,12 +42,22 @@ Server starts at `http://localhost:8081/v1`.
 
 ### curl
 
+#### bash / macOS / Linux
+
 ```bash
 curl http://localhost:8081/v1/chat/completions \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer sk-your-key" \
   -d '{"model":"gemini-3.5-flash","messages":[{"role":"user","content":"Hello!"}]}'
 ```
+
+#### PowerShell (Windows)
+
+```powershell
+curl.exe --% http://127.0.0.1:8081/v1/chat/completions -H "Content-Type: application/json" -H "Authorization: Bearer sk-your-key" -d "{\"model\":\"gemini-3.5-flash\",\"messages\":[{\"role\":\"user\",\"content\":\"Hello!\"}]}"
+```
+
+> Note: On Windows PowerShell, use `curl.exe` and `--%` so PowerShell does not reinterpret JSON quoting or curl options.
 
 ### OpenAI Python SDK
 
@@ -77,12 +88,13 @@ Supports Google native API endpoints:
 
 | Model | Description | Output |
 |-------|-------------|--------|
-| `gemini-3.5-flash` | Fast general-purpose | ~12k chars |
-| `gemini-3.5-flash-thinking` | Deep thinking, longest output | **~20k chars** |
+| `gemini-3.6-flash` | All-around model (latest) | ~12k chars |
+| `gemini-3.5-flash` | Alias for gemini-3.6-flash | ~12k chars |
+| `gemini-3.5-flash-thinking` | Extended thinking, longest output | **~20k chars** |
 | `gemini-3.5-flash-thinking-lite` | Adaptive thinking depth | ~15k chars |
-| `gemini-3.1-pro` | Pro (needs cookie for real routing) | ~12k chars |
+| `gemini-3.1-pro` | Advanced math & code (needs cookie) | ~12k chars |
 | `gemini-auto` | Auto model selection | varies |
-| `gemini-flash-lite` | Lightweight fast | ~10k chars |
+| `gemini-flash-lite` | Fastest answers, lightweight | ~10k chars |
 
 ### Thinking Depth
 
@@ -96,7 +108,7 @@ gemini-3.5-flash-thinking@think=4   # shallowest
 
 ## Optional: Cookie for Pro
 
-Anonymous access works for all models, but `gemini-3.1-pro` routes to Flash without authentication. To get real Pro routing, provide a cookie file:
+Anonymous access works for all models, but `gemini-3.1-pro` routes to Flash without authentication. To get real Pro routing, you need a **Gemini Advanced (paid subscription)** account cookie:
 
 ```bash
 python gemini_web2api.py --cookie-file cookie.txt
@@ -104,7 +116,7 @@ python gemini_web2api.py --cookie-file cookie.txt
 
 ### How to get cookies
 
-1. Open Chrome, go to [gemini.google.com](https://gemini.google.com) and sign in with any free Google account
+1. Open Chrome, go to [gemini.google.com](https://gemini.google.com) and sign in with a **Gemini Advanced** Google account
 2. Open DevTools (F12) → Application → Cookies → `https://gemini.google.com`
 3. Copy these cookie values: `SID`, `HSID`, `SSID`, `APISID`, `SAPISID`, `__Secure-1PSID`
 4. Create `cookie.txt` in this format:
@@ -143,7 +155,7 @@ Example:
 
 If authenticated requests return HTTP 400 with an `xsrf` error, refresh Gemini Web, update `xsrf_token`, and make sure `auth_user` matches the `/u/<index>/` part of the browser URL.
 
-No paid subscription needed — a free Google account is sufficient.
+Pro routing requires **Gemini Advanced** (paid subscription). A free Google account cookie will authenticate but silently fall back to Flash.
 
 ## Configuration
 
@@ -156,7 +168,7 @@ Create `config.json` in the same directory:
   "retry_attempts": 3,
   "retry_delay_sec": 2,
   "request_timeout_sec": 180,
-  "gemini_bl": "boq_assistant-bard-web-server_20260525.09_p0",
+  "gemini_bl": "boq_assistant-bard-web-server_20260716.08_p0",
   "auth_user": null,
   "xsrf_token": null,
   "api_keys": ["sk-your-key"],
@@ -190,6 +202,8 @@ docker run -d --name gemini-web2api -p 8081:8081 -v ./config.json:/app/config.js
 ```
 
 Set `"cookie_file": "/app/cookie.txt"` in `config.json`.
+
+> **Note**: If you get empty responses (`content: null`) with Docker's default bridge network, switch to host networking: `docker run --network host ...` or add `network_mode: host` in your compose file. This is caused by Gemini's upstream rejecting requests from certain Docker NAT IP ranges.
 
 ## Proxy
 
@@ -240,7 +254,7 @@ resp = client.chat.completions.create(
 ## Requirements
 
 - Python 3.8+
-- No external dependencies (stdlib only)
+- `httpx` (`pip install httpx`) — used for streaming requests
 - Network access to `gemini.google.com` (proxy/VPN may be needed in some regions)
 
 ## How It Works

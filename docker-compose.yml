@@ -1,0 +1,19 @@
+services:
+  gemini-web2api:
+    build: .
+    container_name: gemini-web2api
+    ports:
+      - "8081:8081"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./config.json:/app/config.json
+    networks:
+      - default
+      - warp-plus
+    restart: unless-stopped
+
+networks:
+  warp-plus:
+    external: true
+    name: warp-plus_default
