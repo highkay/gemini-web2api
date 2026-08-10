@@ -5,9 +5,11 @@ import uuid
 import re
 import urllib.request
 import urllib.parse
+import urllib.error
 import ssl
 import os
 import hashlib
+from typing import Optional
 
 try:
     import httpx
@@ -16,10 +18,12 @@ except ImportError:
     HAS_HTTPX = False
 
 from .config import CONFIG
+from .proxy_pool import POOL, is_block_error, is_block_response, error_reason
 
 _ssl_ctx = None
 _cookie_cache = {"str": "", "sapisid": None, "mtime": 0}
-_httpx_client = None
+_httpx_clients: dict[str, "httpx.Client"] = {}
+_httpx_lock = None
 
 
 def log(msg: str):
@@ -36,13 +40,52 @@ def _get_ssl_ctx():
     return _ssl_ctx
 
 
-def _get_httpx_client():
-    global _httpx_client
-    if _httpx_client is None and HAS_HTTPX:
-        proxy = CONFIG.get("proxy")
-        transport = httpx.HTTPTransport(proxy=proxy) if proxy else None
-        _httpx_client = httpx.Client(transport=transport, timeout=CONFIG["request_timeout_sec"], verify=True)
-    return _httpx_client
+def _client_key(proxy: Optional[str]) -> str:
+    return proxy or "__direct__"
+
+
+def _get_httpx_client(proxy: Optional[str] = None):
+    """Get or create a per-proxy httpx client (supports socks5:// via socksio)."""
+    global _httpx_lock
+    if not HAS_HTTPX:
+        return None
+    if _httpx_lock is None:
+        import threading
+        _httpx_lock = threading.Lock()
+    key = _client_key(proxy)
+    with _httpx_lock:
+        client = _httpx_clients.get(key)
+        if client is not None:
+            return client
+        # Follow redirects only for non-API pages; StreamGenerate captcha is 302.
+        # We disable auto-follow so we can detect block redirects cleanly.
+        timeout = CONFIG["request_timeout_sec"]
+        if proxy:
+            client = httpx.Client(
+                proxy=proxy,
+                timeout=timeout,
+                verify=True,
+                follow_redirects=False,
+            )
+        else:
+            client = httpx.Client(
+                timeout=timeout,
+                verify=True,
+                follow_redirects=False,
+            )
+        _httpx_clients[key] = client
+        return client
+
+
+def reset_httpx_clients():
+    """Close cached clients (e.g. after config reload)."""
+    global _httpx_clients
+    for c in list(_httpx_clients.values()):
+        try:
+            c.close()
+        except Exception:
+            pass
+    _httpx_clients = {}
 
 
 def load_cookie() -> tuple:
@@ -189,38 +232,133 @@ def extract_response_text(raw: str) -> str:
     return clean_text(last_text)
 
 
+def _max_proxy_attempts() -> int:
+    proxies = POOL.all_proxies()
+    # Try each exit once per request, capped by retry_attempts * pool size.
+    return max(CONFIG["retry_attempts"], len(proxies) if proxies else 1)
+
+
+class BlockedUpstreamError(RuntimeError):
+    """Raised when Google returns captcha / rate-limit style block."""
+    def __init__(self, message: str, status_code: int = 0):
+        super().__init__(message)
+        self.status_code = status_code
+
+
+def _open_with_proxy(req: urllib.request.Request, proxy: Optional[str], timeout: float):
+    """Open request via optional HTTP(S) proxy using urllib. SOCKS not supported here."""
+    ctx = _get_ssl_ctx()
+    if proxy and proxy.startswith(("socks5://", "socks5h://", "socks4://")):
+        raise RuntimeError(f"urllib path does not support SOCKS proxy: {proxy} (use httpx)")
+    if proxy:
+        opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({"http": proxy, "https": proxy}),
+            urllib.request.HTTPSHandler(context=ctx),
+        )
+        # Do not auto-follow redirects — captcha is a 302.
+        class _NoRedirect(urllib.request.HTTPRedirectHandler):
+            def redirect_request(self, req, fp, code, msg, headers, newurl):
+                return None
+        opener.add_handler(_NoRedirect())
+        return opener.open(req, timeout=timeout)
+    # direct
+    class _NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, req, fp, code, msg, headers, newurl):
+            return None
+    opener = urllib.request.build_opener(
+        urllib.request.HTTPSHandler(context=ctx),
+        _NoRedirect(),
+    )
+    return opener.open(req, timeout=timeout)
+
+
+def _generate_once_httpx(url: str, body: bytes, headers: dict, proxy: Optional[str]) -> str:
+    client = _get_httpx_client(proxy)
+    resp = client.post(url, content=body, headers=headers)
+    content = resp.content
+    if is_block_response(resp.status_code, resp.headers, content):
+        loc = resp.headers.get("Location") or resp.headers.get("location") or ""
+        raise BlockedUpstreamError(
+            f"blocked HTTP {resp.status_code}" + (f" -> {loc[:120]}" if loc else ""),
+            status_code=resp.status_code,
+        )
+    resp.raise_for_status()
+    raw = content.decode("utf-8", errors="replace")
+    if is_block_response(200, None, raw):
+        raise BlockedUpstreamError("blocked body (captcha/sorry)")
+    return extract_response_text(raw)
+
+
+def _generate_once_urllib(url: str, body: bytes, headers: dict, proxy: Optional[str]) -> str:
+    req = urllib.request.Request(url, data=body, headers=headers, method="POST")
+    try:
+        resp = _open_with_proxy(req, proxy, CONFIG["request_timeout_sec"])
+        raw_bytes = resp.read()
+        raw = raw_bytes.decode("utf-8", errors="replace")
+        if is_block_response(getattr(resp, "status", 200), resp.headers, raw_bytes):
+            raise BlockedUpstreamError("blocked response")
+        return extract_response_text(raw)
+    except urllib.error.HTTPError as e:
+        body_bytes = b""
+        try:
+            body_bytes = e.read()
+        except Exception:
+            pass
+        if is_block_response(e.code, e.headers, body_bytes):
+            loc = ""
+            try:
+                loc = e.headers.get("Location") if e.headers else ""
+            except Exception:
+                pass
+            raise BlockedUpstreamError(
+                f"blocked HTTP {e.code}" + (f" -> {loc[:120]}" if loc else f": {e.reason}"),
+                status_code=e.code,
+            ) from e
+        raise
+
+
 def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None, extra_fields: dict = None) -> str:
-    """Non-streaming generation with retry."""
+    """Non-streaming generation with proxy rotation + retry."""
     body = _build_payload(prompt, model_id, think_mode, file_refs, extra_fields).encode()
     url = _get_url()
     headers = _build_headers()
-    ctx = _get_ssl_ctx()
-    proxy = CONFIG.get("proxy")
 
     last_err = None
-    for attempt in range(CONFIG["retry_attempts"]):
+    attempts = _max_proxy_attempts()
+    tried: set = set()
+
+    for attempt in range(attempts):
+        candidates = [c for c in POOL.candidates() if _client_key(c) not in tried]
+        if not candidates:
+            # Full cycle exhausted; allow re-try of best available.
+            candidates = POOL.candidates()
+            tried.clear()
+        proxy = candidates[0] if candidates else None
+        tried.add(_client_key(proxy))
+        label = proxy or "direct"
         try:
-            req = urllib.request.Request(url, data=body, headers=headers, method="POST")
-            if proxy:
-                opener = urllib.request.build_opener(
-                    urllib.request.ProxyHandler({"http": proxy, "https": proxy}),
-                    urllib.request.HTTPSHandler(context=ctx)
-                )
-                resp = opener.open(req, timeout=CONFIG["request_timeout_sec"])
+            if HAS_HTTPX:
+                text = _generate_once_httpx(url, body, headers, proxy)
             else:
-                resp = urllib.request.urlopen(req, context=ctx, timeout=CONFIG["request_timeout_sec"])
-            raw = resp.read().decode("utf-8", errors="replace")
-            return extract_response_text(raw)
+                text = _generate_once_urllib(url, body, headers, proxy)
+            POOL.mark_success(proxy)
+            return text
+        except BlockedUpstreamError as e:
+            last_err = e
+            POOL.mark_failure(proxy, str(e), force_rotate=True)
+            log(f"Upstream blocked via {label}: {e}")
         except Exception as e:
             last_err = e
-            if attempt < CONFIG["retry_attempts"] - 1:
-                log(f"Retry {attempt+1}/{CONFIG['retry_attempts']}: {e}")
+            reason = error_reason(e)
+            POOL.mark_failure(proxy, reason, force_rotate=True)
+            log(f"Retry {attempt+1}/{attempts} via {label}: {e}")
+            if attempt < attempts - 1:
                 time.sleep(CONFIG["retry_delay_sec"])
     raise last_err
 
 
 def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list = None, extra_fields: dict = None):
-    """Streaming generation via httpx with retry on connection failure."""
+    """Streaming generation via httpx with proxy rotation on failure."""
     if not HAS_HTTPX:
         text = generate(prompt, model_id, think_mode, file_refs, extra_fields)
         if text:
@@ -230,16 +368,48 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
     body = _build_payload(prompt, model_id, think_mode, file_refs, extra_fields)
     url = _get_url()
     headers = _build_headers()
-    client = _get_httpx_client()
 
     last_err = None
-    for attempt in range(CONFIG["retry_attempts"]):
+    attempts = _max_proxy_attempts()
+    tried: set = set()
+
+    for attempt in range(attempts):
+        candidates = [c for c in POOL.candidates() if _client_key(c) not in tried]
+        if not candidates:
+            candidates = POOL.candidates()
+            tried.clear()
+        proxy = candidates[0] if candidates else None
+        tried.add(_client_key(proxy))
+        label = proxy or "direct"
+        client = _get_httpx_client(proxy)
         try:
             prev_text = ""
             with client.stream("POST", url, content=body, headers=headers) as resp:
+                # Read a small prefix to detect captcha/block before streaming out.
+                # httpx stream: check status first.
+                if is_block_response(resp.status_code, resp.headers, b""):
+                    # consume body for better diagnostics
+                    try:
+                        peek = resp.read()
+                    except Exception:
+                        peek = b""
+                    loc = resp.headers.get("Location") or resp.headers.get("location") or ""
+                    raise BlockedUpstreamError(
+                        f"blocked HTTP {resp.status_code}" + (f" -> {loc[:120]}" if loc else ""),
+                        status_code=resp.status_code,
+                    )
+                if resp.status_code >= 400:
+                    peek = resp.read()
+                    if is_block_response(resp.status_code, resp.headers, peek):
+                        raise BlockedUpstreamError(f"blocked HTTP {resp.status_code}", status_code=resp.status_code)
+                    resp.raise_for_status()
+
                 buf = ""
                 for chunk in resp.iter_text():
                     buf += chunk
+                    # Early captcha body detection
+                    if len(buf) < 500 and is_block_response(200, None, buf):
+                        raise BlockedUpstreamError("blocked body (captcha/sorry)")
                     while "\n" in buf:
                         line, buf = buf.split("\n", 1)
                         for t in _extract_texts_from_line(line):
@@ -248,10 +418,21 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
                                 if delta:
                                     yield delta
                                 prev_text = t
+            POOL.mark_success(proxy)
             return
+        except BlockedUpstreamError as e:
+            last_err = e
+            POOL.mark_failure(proxy, str(e), force_rotate=True)
+            log(f"Stream blocked via {label}: {e}")
         except Exception as e:
             last_err = e
-            if attempt < CONFIG["retry_attempts"] - 1:
-                log(f"Stream retry {attempt+1}/{CONFIG['retry_attempts']}: {e}")
+            reason = error_reason(e)
+            if is_block_error(e):
+                POOL.mark_failure(proxy, reason, force_rotate=True)
+                log(f"Stream block-like via {label}: {reason}")
+            else:
+                POOL.mark_failure(proxy, reason, force_rotate=True)
+                log(f"Stream retry {attempt+1}/{attempts} via {label}: {e}")
+            if attempt < attempts - 1:
                 time.sleep(CONFIG["retry_delay_sec"])
     raise last_err

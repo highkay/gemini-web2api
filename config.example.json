@@ -13,5 +13,17 @@
   ],
   "cookie_file": null,
   "proxy": null,
+  "proxies": [
+    "socks5://warpplus-ca:1080",
+    "socks5://warpplus-de:1080",
+    "socks5://warpplus-gb:1080",
+    "socks5://warpplus-us:1080"
+  ],
+  "proxy_rotate": {
+    "enabled": true,
+    "cooldown_sec": 300,
+    "fail_threshold": 1,
+    "probe_on_start": false
+  },
   "log_requests": true
 }

@@ -15,6 +15,15 @@ DEFAULT_CONFIG = {
     "log_requests": True,
     "cookie_file": None,
     "proxy": None,
+    # Optional multi-exit list. When set, overrides single `proxy` for rotation.
+    # Supports http://host:port and socks5://host:port (httpx + socksio).
+    "proxies": [],
+    "proxy_rotate": {
+        "enabled": True,
+        "cooldown_sec": 300,
+        "fail_threshold": 1,
+        "probe_on_start": False,
+    },
     "api_keys": [],
 }
 

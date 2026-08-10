@@ -11,6 +11,7 @@ from .models import MODELS, resolve_model
 from .gemini import generate, generate_stream, log
 from .tools import messages_to_prompt, parse_tool_calls, google_contents_to_prompt, parse_google_function_calls
 from .multimodal import upload_image, fetch_image_bytes
+from .proxy_pool import POOL
 from . import __version__
 
 
@@ -100,6 +101,8 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 ]})
             elif self.path == "/":
                 self.send_json({"status": "ok", "version": __version__, "models": list(MODELS.keys())})
+            elif self.path in ("/status", "/v1/proxy/status"):
+                self.send_json({"status": "ok", "version": __version__, "proxy_pool": POOL.status()})
             else:
                 self.send_json({"error": "not found"}, 404)
         except (BrokenPipeError, ConnectionResetError):

@@ -6,6 +6,7 @@ from .config import CONFIG, load_config, find_config
 from .models import MODELS
 from .gemini import HAS_HTTPX
 from .server import GeminiHandler, ThreadedServer
+from .proxy_pool import POOL
 from . import __version__
 
 
@@ -29,6 +30,10 @@ def main():
     if args.proxy:
         CONFIG["proxy"] = args.proxy
 
+    # Initialize multi-exit proxy pool (proxies[] preferred over single proxy).
+    POOL.configure_from_config()
+    pool_status = POOL.status()
+
     port = CONFIG["port"]
     server = ThreadedServer((CONFIG["host"], port), GeminiHandler)
     print(f"gemini-web2api v{__version__}")
@@ -36,7 +41,11 @@ def main():
     print(f"  Base URL:  http://localhost:{port}/v1")
     print(f"  Models:    {', '.join(MODELS.keys())}")
     print(f"  Cookie:    {'yes' if CONFIG.get('cookie_file') else 'none (anonymous)'}")
-    print(f"  Proxy:     {CONFIG.get('proxy') or 'system env'}")
+    print(f"  Proxy:     {pool_status.get('current') or CONFIG.get('proxy') or 'system env'}")
+    exits = [e["proxy"] for e in pool_status.get("exits", [])]
+    if len(exits) > 1:
+        print(f"  Proxy pool:{len(exits)} exits, rotate={'on' if pool_status.get('enabled') else 'off'}")
+        print(f"  Exits:     {', '.join(exits)}")
     print(f"  Streaming: {'httpx (true streaming)' if HAS_HTTPX else 'urllib (buffered)'}")
     print()
     try:

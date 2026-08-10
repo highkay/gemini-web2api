@@ -1,14 +1,11 @@
 """Multimodal: Scotty resumable upload for Gemini image input."""
-import json
-import base64
-import urllib.request
-import urllib.parse
-import time
-import ssl
 import re
+import time
+from typing import Optional
 
 from .config import CONFIG
-from .gemini import load_cookie, make_sapisidhash, _get_ssl_ctx, log
+from .gemini import HAS_HTTPX, load_cookie, make_sapisidhash, _get_httpx_client, log
+from .proxy_pool import POOL, is_block_response, error_reason
 
 
 def _get_page_tokens() -> dict:
@@ -20,9 +17,7 @@ def _get_page_tokens() -> dict:
     if cookie_str:
         headers["Cookie"] = cookie_str
     try:
-        req = urllib.request.Request("https://gemini.google.com/app", headers=headers)
-        resp = urllib.request.urlopen(req, context=_get_ssl_ctx(), timeout=30)
-        html = resp.read().decode()
+        html = _http_get("https://gemini.google.com/app", headers=headers, timeout=30)
         tokens = {}
         for key, pattern in [
             ("push_id", r'"qKIAYe":"([^"]+)"'),
@@ -49,6 +44,38 @@ def _cached_page_tokens() -> dict:
     return _page_tokens_cache["tokens"]
 
 
+def _http_request(method: str, url: str, headers: dict, data: bytes = None, timeout: float = 30):
+    """HTTP request via current proxy pool exit (httpx preferred for SOCKS)."""
+    last_err = None
+    for proxy in POOL.candidates():
+        label = proxy or "direct"
+        try:
+            if not HAS_HTTPX:
+                raise RuntimeError("httpx required for proxy pool multimodal path")
+            client = _get_httpx_client(proxy)
+            resp = client.request(method, url, content=data, headers=headers, timeout=timeout)
+            if is_block_response(resp.status_code, resp.headers, resp.content):
+                POOL.mark_failure(proxy, f"blocked HTTP {resp.status_code}", force_rotate=True)
+                last_err = RuntimeError(f"blocked via {label}: HTTP {resp.status_code}")
+                continue
+            if resp.status_code >= 400:
+                POOL.mark_failure(proxy, f"HTTP {resp.status_code}", force_rotate=True)
+                last_err = RuntimeError(f"HTTP {resp.status_code} via {label}")
+                continue
+            POOL.mark_success(proxy)
+            return resp
+        except Exception as e:
+            last_err = e
+            POOL.mark_failure(proxy, error_reason(e), force_rotate=True)
+            log(f"HTTP {method} via {label} failed: {e}")
+    raise last_err or RuntimeError("all proxies failed")
+
+
+def _http_get(url: str, headers: dict, timeout: float = 30) -> str:
+    resp = _http_request("GET", url, headers=headers, timeout=timeout)
+    return resp.content.decode("utf-8", errors="replace")
+
+
 def upload_image(image_bytes: bytes, filename: str = "image.png", mime_type: str = "image/png") -> str:
     """Upload image via Scotty resumable upload. Returns file reference path."""
     tokens = _cached_page_tokens()
@@ -56,8 +83,6 @@ def upload_image(image_bytes: bytes, filename: str = "image.png", mime_type: str
     pctx = tokens.get("pctx", "CgcSBWjK7pYx")
 
     cookie_str, sapisid = load_cookie()
-    ctx = _get_ssl_ctx()
-    proxy = CONFIG.get("proxy")
 
     # Step 1: Initiate resumable upload
     start_headers = {
@@ -77,16 +102,7 @@ def upload_image(image_bytes: bytes, filename: str = "image.png", mime_type: str
         start_headers["Authorization"] = make_sapisidhash(sapisid)
 
     start_url = "https://content-push.googleapis.com/upload/"
-    req = urllib.request.Request(start_url, data=b"", headers=start_headers, method="POST")
-
-    if proxy:
-        opener = urllib.request.build_opener(
-            urllib.request.ProxyHandler({"http": proxy, "https": proxy}),
-            urllib.request.HTTPSHandler(context=ctx)
-        )
-        resp = opener.open(req, timeout=30)
-    else:
-        resp = urllib.request.urlopen(req, context=ctx, timeout=30)
+    resp = _http_request("POST", start_url, headers=start_headers, data=b"", timeout=30)
 
     upload_url = resp.headers.get("X-Goog-Upload-URL") or resp.headers.get("x-goog-upload-url")
     if not upload_url:
@@ -101,14 +117,9 @@ def upload_image(image_bytes: bytes, filename: str = "image.png", mime_type: str
         "Content-Type": "application/octet-stream",
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
     }
+    resp2 = _http_request("POST", upload_url, headers=upload_headers, data=image_bytes, timeout=60)
 
-    req2 = urllib.request.Request(upload_url, data=image_bytes, headers=upload_headers, method="POST")
-    if proxy:
-        resp2 = opener.open(req2, timeout=60)
-    else:
-        resp2 = urllib.request.urlopen(req2, context=ctx, timeout=60)
-
-    file_ref = resp2.read().decode().strip()
+    file_ref = resp2.content.decode().strip()
     if not file_ref or not file_ref.startswith("/"):
         raise RuntimeError(f"Invalid file reference: {file_ref[:100]}")
 
@@ -117,8 +128,15 @@ def upload_image(image_bytes: bytes, filename: str = "image.png", mime_type: str
 
 
 def fetch_image_bytes(url: str) -> bytes:
-    """Fetch image from URL."""
+    """Fetch image from URL (direct, no Gemini proxy needed)."""
     try:
+        if HAS_HTTPX:
+            import httpx
+            with httpx.Client(timeout=30, follow_redirects=True) as client:
+                r = client.get(url, headers={"User-Agent": "Mozilla/5.0"})
+                r.raise_for_status()
+                return r.content
+        import urllib.request
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
         resp = urllib.request.urlopen(req, timeout=30)
         return resp.read()
