@@ -23,7 +23,10 @@
     "enabled": true,
     "cooldown_sec": 300,
     "fail_threshold": 1,
-    "probe_on_start": false
+    "probe_on_start": false,
+    "dynamic_exits": [
+      "http://user:pass@host:port"
+    ]
   },
   "log_requests": true,
   "temporary_chats": false
