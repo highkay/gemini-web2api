@@ -47,6 +47,7 @@ def main():
         print(f"  Proxy pool:{len(exits)} exits, rotate={'on' if pool_status.get('enabled') else 'off'}")
         print(f"  Exits:     {', '.join(exits)}")
     print(f"  Streaming: {'httpx (true streaming)' if HAS_HTTPX else 'urllib (buffered)'}")
+    print(f"  Temporary: {'yes' if CONFIG.get('temporary_chats', False) else 'no'}")
     print()
     try:
         server.serve_forever()

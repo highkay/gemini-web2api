@@ -427,6 +427,8 @@ def extract_response_text(raw: str) -> str:
 
 # ─── OpenAI Format Helpers ───────────────────────────────────────────────────
 
+PROMPT_MAX_BYTES = 60000
+
 def messages_to_prompt(messages: list, tools: list = None) -> str:
     """Convert OpenAI messages to prompt string."""
     parts = []
@@ -440,12 +442,17 @@ def messages_to_prompt(messages: list, tools: list = None) -> str:
                 "parameters": fn.get("parameters", tool.get("parameters", {})),
             })
         if tool_defs:
+            tools_json = json.dumps(tool_defs, indent=2)
+            if len(tools_json) > PROMPT_MAX_BYTES // 2:
+                slim_defs = [{"name": t["name"], "description": t["description"]} for t in tool_defs]
+                tools_json = json.dumps(slim_defs, indent=2)
+                log(f"Tools block too large ({len(tool_defs)} tools), stripped parameters")
             parts.append(
                 "[System instruction]: You have access to tools. "
                 "To call a tool, respond with:\n"
                 '```tool_call\n{"name": "func_name", "arguments": {...}}\n```\n'
                 "Only use tool_call blocks when needed.\n\n"
-                f"Available tools:\n{json.dumps(tool_defs, indent=2)}"
+                f"Available tools:\n{tools_json}"
             )
     for msg in messages:
         role = msg.get("role", "user")

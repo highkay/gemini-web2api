@@ -25,6 +25,7 @@ DEFAULT_CONFIG = {
         "probe_on_start": False,
     },
     "api_keys": [],
+    "temporary_chats": False,
 }
 
 CONFIG = dict(DEFAULT_CONFIG)
