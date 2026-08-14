@@ -5,15 +5,15 @@
 
 MODELS = {
     "gemini-3.7-flash": {
-        "mode": 1, "think": 4,
+        "mode": 1, "think": 0,
         "desc": "Latest all-around model (Gemini 3.7 Flash)",
     },
     "gemini-3.6-flash": {
-        "mode": 1, "think": 4,
+        "mode": 1, "think": 0,
         "desc": "All-around model (Gemini 3.6 Flash)",
     },
     "gemini-3.5-flash": {
-        "mode": 1, "think": 4,
+        "mode": 1, "think": 0,
         "desc": "Alias for gemini-3.6-flash (backend upgraded)",
     },
     "gemini-3.5-flash-thinking": {
@@ -21,15 +21,15 @@ MODELS = {
         "desc": "Deep thinking mode, longest output (~20k chars)",
     },
     "gemini-3.1-pro": {
-        "mode": 3, "think": 4,
+        "mode": 3, "think": 0,
         "desc": "Pro model (requires cookie for real routing)",
     },
     "gemini-3.1-pro-enhanced": {
-        "mode": 3, "think": 4, "extra": {31: 2, 80: 3},
+        "mode": 3, "think": 0, "extra": {31: 2, 80: 3},
         "desc": "Pro with enhanced output (experimental)",
     },
     "gemini-auto": {
-        "mode": 4, "think": 4,
+        "mode": 4, "think": 0,
         "desc": "Auto model selection",
     },
     "gemini-3.5-flash-thinking-lite": {
@@ -37,7 +37,7 @@ MODELS = {
         "desc": "Dynamic thinking with adaptive depth",
     },
     "gemini-flash-lite": {
-        "mode": 6, "think": 4,
+        "mode": 6, "think": 0,
         "desc": "Lightweight fast model",
     },
 }
