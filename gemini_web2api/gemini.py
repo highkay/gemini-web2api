@@ -252,6 +252,59 @@ def extract_response_text(raw: str) -> str:
     return clean_text(last_text)
 
 
+def extract_citations(raw: str) -> list:
+    """Extract structured citations from grounding chunks (inner[4][0][2][1])."""
+    citations = []
+    seen = set()
+    for line in raw.split("\n"):
+        if '"wrb.fr"' not in line or len(line) < 200:
+            continue
+        try:
+            arr = json.loads(line)
+            inner_str = arr[0][2]
+            if not inner_str or len(inner_str) < 50:
+                continue
+            inner = json.loads(inner_str)
+            if not (isinstance(inner, list) and len(inner) > 4 and inner[4]):
+                continue
+            node_list = inner[4]
+            if not (isinstance(node_list, list) and node_list):
+                continue
+            node = node_list[0]
+            if not (isinstance(node, list) and len(node) > 2):
+                continue
+            grounding = node[2]
+            if not (isinstance(grounding, list) and len(grounding) > 1):
+                continue
+            chunks = grounding[1]
+            if not isinstance(chunks, list):
+                continue
+            for chunk in chunks:
+                if not (isinstance(chunk, list) and len(chunk) > 2):
+                    continue
+                sources = chunk[2]
+                if not isinstance(sources, list):
+                    continue
+                for source in sources:
+                    if not (isinstance(source, list) and len(source) >= 2):
+                        continue
+                    url = source[0]
+                    if not isinstance(url, str):
+                        continue
+                    url = url.split("#:~:text=")[0].split("#", 1)[0]
+                    if not url or url in seen:
+                        continue
+                    title = source[1] if isinstance(source[1], str) else ""
+                    snippet = ""
+                    if len(source) > 3 and isinstance(source[3], str):
+                        snippet = source[3]
+                    seen.add(url)
+                    citations.append({"url": url, "title": title, "snippet": snippet})
+        except (json.JSONDecodeError, IndexError, TypeError):
+            pass
+    return citations
+
+
 def _max_proxy_attempts() -> int:
     proxies = POOL.all_proxies()
     # Try each exit once per request, capped by retry_attempts * pool size.
@@ -306,7 +359,7 @@ def _generate_once_httpx(url: str, body: bytes, headers: dict, proxy: Optional[s
     raw = content.decode("utf-8", errors="replace")
     if is_block_response(200, None, raw):
         raise BlockedUpstreamError("blocked body (captcha/sorry)")
-    return extract_response_text(raw)
+    return extract_response_text(raw), extract_citations(raw)
 
 
 def _generate_once_urllib(url: str, body: bytes, headers: dict, proxy: Optional[str]) -> str:
@@ -317,7 +370,7 @@ def _generate_once_urllib(url: str, body: bytes, headers: dict, proxy: Optional[
         raw = raw_bytes.decode("utf-8", errors="replace")
         if is_block_response(getattr(resp, "status", 200), resp.headers, raw_bytes):
             raise BlockedUpstreamError("blocked response")
-        return extract_response_text(raw)
+        return extract_response_text(raw), extract_citations(raw)
     except urllib.error.HTTPError as e:
         body_bytes = b""
         try:
@@ -346,6 +399,7 @@ def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None
     last_err = None
     attempts = _max_proxy_attempts()
     tried: set = set()
+    citations = []
 
     for attempt in range(attempts):
         candidates = [c for c in POOL.candidates() if _client_key(c) not in tried]
@@ -358,11 +412,11 @@ def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None
         label = proxy or "direct"
         try:
             if HAS_HTTPX:
-                text = _generate_once_httpx(url, body, headers, proxy)
+                text, citations = _generate_once_httpx(url, body, headers, proxy)
             else:
-                text = _generate_once_urllib(url, body, headers, proxy)
+                text, citations = _generate_once_urllib(url, body, headers, proxy)
             POOL.mark_success(proxy)
-            return text
+            return text, citations
         except BlockedUpstreamError as e:
             last_err = e
             POOL.mark_failure(proxy, str(e), force_rotate=True)
@@ -380,7 +434,7 @@ def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None
 def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list = None, extra_fields: dict = None):
     """Streaming generation via httpx with proxy rotation on failure."""
     if not HAS_HTTPX:
-        text = generate(prompt, model_id, think_mode, file_refs, extra_fields)
+        text, _ = generate(prompt, model_id, think_mode, file_refs, extra_fields)
         if text:
             yield text
         return
