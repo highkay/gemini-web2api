@@ -122,7 +122,7 @@ class StreamingEndpointTests(unittest.TestCase):
         self.assertEqual(chunks[2]["choices"][0]["delta"], {"content": "lo"})
         self.assertTrue(body.endswith("data: [DONE]\n\n"))
 
-    @mock.patch("gemini_web2api.server.generate", return_value=("hello", []))
+    @mock.patch("gemini_web2api.server.generate", return_value="hello")
     def test_responses_text_stream_has_complete_event_sequence(self, _generate):
         status, headers, body = self.post_json(
             "/v1/responses",
@@ -159,7 +159,7 @@ class StreamingEndpointTests(unittest.TestCase):
         self.assertEqual(events[-1][1]["response"]["output"][0]["content"][0]["text"], "hello")
 
     @mock.patch("gemini_web2api.server.parse_tool_calls")
-    @mock.patch("gemini_web2api.server.generate", return_value=("tool output", []))
+    @mock.patch("gemini_web2api.server.generate", return_value="tool output")
     def test_responses_function_call_stream_has_complete_event_sequence(
         self, _generate, parse_tool_calls
     ):

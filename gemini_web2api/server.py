@@ -227,7 +227,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
             return
 
         try:
-            text, citations = generate(prompt, model_id, think_mode, _upload_images(images), extra_fields)
+            text = generate(prompt, model_id, think_mode, _upload_images(images), extra_fields)
         except Exception as e:
             self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
             return
@@ -252,7 +252,6 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 "id": cid, "object": "chat.completion", "created": int(time.time()),
                 "model": model_name,
                 "choices": [{"index": 0, "message": msg, "finish_reason": finish}],
-                "citations": citations,
                 "usage": {"prompt_tokens": len(prompt)//4, "completion_tokens": len(text or "")//4,
                           "total_tokens": (len(prompt)+len(text or ""))//4},
             })
@@ -319,7 +318,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
             return
 
         try:
-            text, citations = generate(prompt, model_id, think_mode, _upload_images(images), extra_fields)
+            text = generate(prompt, model_id, think_mode, _upload_images(images), extra_fields)
         except Exception as e:
             self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
             return
@@ -471,13 +470,12 @@ class GeminiHandler(BaseHTTPRequestHandler):
                     "status": "completed",
                     "output": output,
                     "usage": usage,
-                    "citations": citations,
                 },
             )
             self.wfile.flush()
         else:
             self.send_json({"id": rid, "object": "response", "created_at": int(time.time()), "status": "completed",
-                            "model": model_name, "output": output, "citations": citations,
+                            "model": model_name, "output": output,
                             "usage": {"input_tokens": len(prompt)//4, "output_tokens": len(text or "")//4, "total_tokens": (len(prompt)+len(text or ""))//4}})
 
     # ─── /v1beta/models (Google Gemini CLI) ──────────────────────────────────
@@ -535,7 +533,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
             return
 
         try:
-            text, _ = generate(prompt, model_id, think_mode, file_refs, extra_fields)
+            text = generate(prompt, model_id, think_mode, file_refs, extra_fields)
         except Exception as e:
             self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
             return
