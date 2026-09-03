@@ -1,6 +1,6 @@
 services:
   gemini-web2api:
-    build: .
+    image: ghcr.1ms.run/highkay/gemini-web2api:main
     container_name: gemini-web2api
     ports:
       - "8081:8081"
@@ -11,7 +11,7 @@ services:
     networks:
       - default
       - warp-plus
-    restart: unless-stopped
+    restart: always
 
 networks:
   warp-plus:

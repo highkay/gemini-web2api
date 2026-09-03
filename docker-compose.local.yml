@@ -11,7 +11,7 @@ services:
     networks:
       - default
       - warp-plus
-    restart: unless-stopped
+    restart: always
 
 networks:
   warp-plus:
