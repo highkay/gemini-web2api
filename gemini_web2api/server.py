@@ -10,7 +10,7 @@ from .config import CONFIG
 from .models import MODELS, resolve_model
 from .gemini import generate, generate_stream, log
 from .tools import messages_to_prompt, parse_tool_calls, google_contents_to_prompt, parse_google_function_calls
-from .multimodal import upload_image, fetch_image_bytes
+from .multimodal import detect_image_mime, fetch_image_bytes, upload_image
 from .proxy_pool import POOL
 from . import __version__
 
@@ -27,17 +27,20 @@ def _upload_images(images: list) -> list:
         return None
     file_refs = []
     for item in images:
+        if not (isinstance(item, tuple) and len(item) == 2):
+            continue
+        data, mime = item
+        if isinstance(data, str):
+            data = fetch_image_bytes(data)
+            mime = mime or "image/png"
+        if not data:
+            raise RuntimeError("image fetch failed")
+        mime = detect_image_mime(data, mime or "image/png")
         try:
-            if isinstance(item, tuple) and len(item) == 2:
-                data, mime = item
-                if isinstance(data, str):
-                    data = fetch_image_bytes(data)
-                    mime = mime or "image/png"
-                if data:
-                    ref = upload_image(data, "image.png", mime or "image/png")
-                    file_refs.append(ref)
+            ref = upload_image(data, "image.png", mime or "image/png")
+            file_refs.append(ref)
         except Exception as e:
-            log(f"Image upload failed: {e}")
+            raise RuntimeError(f"image upload failed: {e}") from e
     return file_refs if file_refs else None
 
 
@@ -195,6 +198,11 @@ class GeminiHandler(BaseHTTPRequestHandler):
 
         stream = req.get("stream", False)
         cid = f"chatcmpl-{uuid.uuid4().hex[:12]}"
+        try:
+            file_refs = _upload_images(images)
+        except RuntimeError as e:
+            self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
+            return
 
         if stream and (not tools or tool_choice == "none"):
             try:
@@ -212,7 +220,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 }
                 self.wfile.write(f"data: {json.dumps(first_chunk)}\n\n".encode())
                 self.wfile.flush()
-                for delta in generate_stream(prompt, model_id, think_mode, _upload_images(images), extra_fields):
+                for delta in generate_stream(prompt, model_id, think_mode, file_refs, extra_fields):
                     chunk = {"id": cid, "object": "chat.completion.chunk", "created": int(time.time()),
                              "model": model_name, "choices": [{"index": 0, "delta": {"content": delta}, "finish_reason": None}]}
                     self.wfile.write(f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode())
@@ -224,10 +232,12 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 self.wfile.flush()
             except (BrokenPipeError, ConnectionResetError):
                 pass
+            except Exception as e:
+                log(f"Stream error: {e}")
             return
 
         try:
-            text = generate(prompt, model_id, think_mode, _upload_images(images), extra_fields)
+            text = generate(prompt, model_id, think_mode, file_refs, extra_fields)
         except Exception as e:
             self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
             return
@@ -284,14 +294,18 @@ class GeminiHandler(BaseHTTPRequestHandler):
                     if item.get("type") == "function_call_output":
                         messages.append({"role": "tool", "tool_call_id": item.get("call_id", ""),
                                          "name": item.get("name", ""), "content": item.get("output", "")})
+                    elif item.get("type") in ("input_text", "input_image", "image"):
+                        messages.append({"role": "user", "content": [item]})
                     elif item.get("role") == "assistant" or (item.get("type") == "message" and item.get("role") == "assistant"):
                         cp = item.get("content", [])
                         text_acc, tc_list = "", []
                         if isinstance(cp, list):
                             for c in cp:
                                 if isinstance(c, dict):
-                                    if c.get("type") == "output_text": text_acc += c.get("text", "")
-                                    elif c.get("type") == "function_call": tc_list.append(c)
+                                    if c.get("type") == "output_text":
+                                        text_acc += c.get("text", "")
+                                    elif c.get("type") == "function_call":
+                                        tc_list.append(c)
                         elif isinstance(cp, str):
                             text_acc = cp
                         m = {"role": "assistant", "content": text_acc or None}
@@ -302,10 +316,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
                         messages.append(m)
                     else:
                         role = item.get("role", "user")
-                        content = item.get("content", "")
-                        if isinstance(content, list):
-                            content = " ".join(c.get("text", "") for c in content if c.get("type") in ("text", "input_text"))
-                        messages.append({"role": role, "content": content})
+                        messages.append({"role": role, "content": item.get("content", "")})
 
         if tools:
             tools = [{"type": "function", "function": {"name": t["name"], "description": t.get("description", ""), "parameters": t.get("parameters", {})}}
@@ -318,7 +329,8 @@ class GeminiHandler(BaseHTTPRequestHandler):
             return
 
         try:
-            text = generate(prompt, model_id, think_mode, _upload_images(images), extra_fields)
+            file_refs = _upload_images(images)
+            text = generate(prompt, model_id, think_mode, file_refs, extra_fields)
         except Exception as e:
             self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
             return
@@ -500,7 +512,11 @@ class GeminiHandler(BaseHTTPRequestHandler):
             self.send_json({"error": {"message": "empty content"}}, 400)
             return
 
-        file_refs = _upload_images(images)
+        try:
+            file_refs = _upload_images(images)
+        except RuntimeError as e:
+            self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
+            return
         log(f"Google API: model={model_name} stream={stream} tools={has_tools} prompt_len={len(prompt)}")
 
         if stream and not has_tools:
@@ -530,6 +546,8 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 self.wfile.flush()
             except (BrokenPipeError, ConnectionResetError):
                 pass
+            except Exception as e:
+                log(f"Google stream error: {e}")
             return
 
         try:

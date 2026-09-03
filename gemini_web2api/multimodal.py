@@ -1,9 +1,8 @@
 """Multimodal: Scotty resumable upload for Gemini image input."""
 import re
 import time
-from typing import Optional
+from urllib.parse import urlparse
 
-from .config import CONFIG
 from .gemini import HAS_HTTPX, load_cookie, make_sapisidhash, _get_httpx_client, log
 from .proxy_pool import POOL, is_block_response, error_reason
 
@@ -16,6 +15,8 @@ def _get_page_tokens() -> dict:
     cookie_str, sapisid = load_cookie()
     if cookie_str:
         headers["Cookie"] = cookie_str
+    if sapisid:
+        headers["Authorization"] = make_sapisidhash(sapisid)
     try:
         html = _http_get("https://gemini.google.com/app", headers=headers, timeout=30)
         tokens = {}
@@ -74,6 +75,29 @@ def _http_request(method: str, url: str, headers: dict, data: bytes = None, time
 def _http_get(url: str, headers: dict, timeout: float = 30) -> str:
     resp = _http_request("GET", url, headers=headers, timeout=timeout)
     return resp.content.decode("utf-8", errors="replace")
+def detect_image_mime(image_bytes: bytes, fallback: str = "image/png") -> str:
+    """Infer a common raster image MIME type from its file signature."""
+    if not isinstance(image_bytes, bytes):
+        return fallback
+    if image_bytes.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if image_bytes.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if image_bytes.startswith((b"GIF87a", b"GIF89a")):
+        return "image/gif"
+    if image_bytes.startswith(b"RIFF") and image_bytes[8:12] == b"WEBP":
+        return "image/webp"
+    if image_bytes.startswith(b"BM"):
+        return "image/bmp"
+    if image_bytes.startswith((b"II*\x00", b"MM\x00*")):
+        return "image/tiff"
+    if len(image_bytes) >= 12 and image_bytes[4:8] == b"ftyp":
+        brand = image_bytes[8:12]
+        if brand in (b"avif", b"avis"):
+            return "image/avif"
+        if brand in (b"heic", b"heix", b"hevc", b"hevx"):
+            return "image/heic"
+    return fallback
 
 
 def upload_image(image_bytes: bytes, filename: str = "image.png", mime_type: str = "image/png") -> str:
@@ -128,7 +152,11 @@ def upload_image(image_bytes: bytes, filename: str = "image.png", mime_type: str
 
 
 def fetch_image_bytes(url: str) -> bytes:
-    """Fetch image from URL (direct, no Gemini proxy needed)."""
+    """Fetch image from URL."""
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        log(f"Image fetch skipped for unsupported URL scheme: {parsed.scheme or 'none'}")
+        return b""
     try:
         if HAS_HTTPX:
             import httpx
