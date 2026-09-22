@@ -9,6 +9,7 @@ import urllib.error
 import ssl
 import os
 import hashlib
+import threading
 from typing import Optional
 
 try:
@@ -50,7 +51,6 @@ def _get_httpx_client(proxy: Optional[str] = None):
     if not HAS_HTTPX:
         return None
     if _httpx_lock is None:
-        import threading
         _httpx_lock = threading.Lock()
     key = _client_key(proxy)
     with _httpx_lock:
@@ -60,9 +60,11 @@ def _get_httpx_client(proxy: Optional[str] = None):
         # Follow redirects only for non-API pages; StreamGenerate captcha is 302.
         # We disable auto-follow so we can detect block redirects cleanly.
         # Phase-scoped timeouts (2026-09-22): fail fast on tunnel/build errors and on
-        # hung responses so the retry chain can rotate exits inside the caller's budget
-        # (4 attempts × 25s + 3×2s delay ≈ 106s ≤ 120s ANSWER_TIMEOUT_MS at :9010).
-        timeout = httpx.Timeout(connect=5.0, read=20.0, write=10.0, pool=5.0)
+        # stalled responses so the retry chain rotates exits inside the caller's budget
+        # (httpx read = max gap between socket reads, not per-attempt total). Worst-case
+        # failing chain: 3 attempts × (5s connect + 30s read) + 2 × 2s delay = 109s
+        # ≤ 120s ANSWER_TIMEOUT_MS at :9010.
+        timeout = httpx.Timeout(connect=5.0, read=30.0, write=10.0, pool=5.0)
         if proxy:
             client = httpx.Client(
                 proxy=proxy,
@@ -92,30 +94,51 @@ def reset_httpx_clients():
 
 
 def _reset_httpx_client(proxy: Optional[str]) -> None:
-    """Drop one cached httpx client so the next retry opens a fresh tunnel.
+    """Evict one cached httpx client so the next retry opens a fresh tunnel.
 
-    Kills the stale keep-alive connections that cause SSL UNEXPECTED_EOF on the
-    alternate exit after a failed attempt (2026-09-22).
+    The client is popped from the cache at once (the retrying request builds a fresh
+    tunnel, killing the stale keep-alive connections behind SSL UNEXPECTED_EOF), but
+    closed on a short timer: closing inline would tear down connections that concurrent
+    requests are still streaming on (2026-09-22).
     """
     global _httpx_clients, _httpx_lock
     if not HAS_HTTPX:
         return
     if _httpx_lock is None:
-        import threading
         _httpx_lock = threading.Lock()
     key = _client_key(proxy)
     with _httpx_lock:
         client = _httpx_clients.pop(key, None)
-    if client is not None:
+    if client is None:
+        return
+
+    def _close() -> None:
         try:
             client.close()
         except Exception:
             pass
 
+    timer = threading.Timer(30.0, _close)
+    timer.daemon = True
+    timer.start()
+
 
 def _is_transport_error(exc: BaseException) -> bool:
-    """True for connection/TLS/read failures (as opposed to block or Bard errors)."""
-    return bool(HAS_HTTPX) and isinstance(exc, httpx.TransportError)
+    """True only for connection-establishment / protocol-break failures.
+
+    Deliberately excludes ReadTimeout/WriteTimeout/PoolTimeout: a quiet socket does not
+    mean the cached tunnel is broken, and evicting the shared client on a slow-but-healthy
+    stream would break concurrent in-flight streams for no benefit (2026-09-22).
+    """
+    return bool(HAS_HTTPX) and isinstance(
+        exc,
+        (
+            httpx.ConnectTimeout,
+            httpx.ProxyError,
+            httpx.NetworkError,   # covers ConnectError / ReadError / WriteError
+            httpx.ProtocolError,  # covers RemoteProtocolError
+        ),
+    )
 
 
 def load_cookie() -> tuple:

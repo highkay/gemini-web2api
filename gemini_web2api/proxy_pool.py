@@ -86,19 +86,23 @@ class ProxyPool:
                 }
                 for p in ordered
             }
-            if old_current in ordered:
+            self._dynamic_exits = {
+                _normalize_proxy(p) for p in (rotate.get("dynamic_exits") or [])
+            }
+            # Dynamic exits (per-request IP rotation) are a last-resort layer, never a
+            # place to pin the pool: a single fallback to one of them must not make every
+            # later request lead with it (2026-09-22).
+            static_ordered = [p for p in ordered if p not in self._dynamic_exits]
+            if old_current in ordered and old_current not in self._dynamic_exits:
                 self._current = old_current
             else:
-                self._current = ordered[0] if ordered else None
+                self._current = (static_ordered or ordered or [None])[0]
             self._configured = True
             self._rotate_cfg = {
                 "enabled": bool(rotate.get("enabled", True)),
                 "cooldown_sec": float(rotate.get("cooldown_sec", 300)),
                 "fail_threshold": int(rotate.get("fail_threshold", 1)),
                 "probe_on_start": bool(rotate.get("probe_on_start", False)),
-            }
-            self._dynamic_exits = {
-                _normalize_proxy(p) for p in (rotate.get("dynamic_exits") or [])
             }
 
         labels = ", ".join(_proxy_label(p) for p in ordered) or "direct"
@@ -162,13 +166,16 @@ class ProxyPool:
                 else:
                     cooled.append(p)
 
-            # Prefer sticky current if healthy.
+            # Prefer sticky current if healthy; dynamic exits always trail the statics.
+            healthy_static = [p for p in healthy if p not in self._dynamic_exits]
+            healthy_dynamic = [p for p in healthy if p in self._dynamic_exits]
             result: list[Optional[str]] = []
-            if current in healthy:
+            if current in healthy_static:
                 result.append(current)
-                result.extend(p for p in healthy if p != current)
+                result.extend(p for p in healthy_static if p != current)
             else:
-                result.extend(healthy)
+                result.extend(healthy_static)
+            result.extend(healthy_dynamic)
 
             # If everything is in cooldown, still try soonest-to-recover first.
             if not result:
@@ -192,7 +199,8 @@ class ProxyPool:
             st["last_ok"] = time.time()
             st["successes"] = int(st.get("successes") or 0) + 1
             st["last_error"] = None
-            self._current = proxy
+            if proxy not in self._dynamic_exits:
+                self._current = proxy
 
     def mark_failure(self, proxy: Optional[str], reason: str, force_rotate: bool = True) -> Optional[str]:
         """Mark proxy failed. Returns the next proxy to try (may be same if rotation disabled)."""

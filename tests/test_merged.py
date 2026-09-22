@@ -196,3 +196,18 @@ class DynamicExitTest(unittest.TestCase):
         candidates = POOL.candidates()
         self.assertIn("http://user:pass@127.0.0.1:2260", candidates,
                       "dynamic exit returns to rotation immediately (new IP next request)")
+
+    def test_dynamic_exit_never_leads_and_never_pins_pool(self):
+        POOL.mark_success("socks5://exit-b:1080")  # clean cooldown left by other tests
+        POOL.mark_success("http://user:pass@127.0.0.1:2260")
+        self.assertEqual(POOL.current(), "socks5://exit-b:1080",
+                         "a dynamic success must not pin the pool to the shared rotation exit")
+        self.assertEqual(POOL.candidates()[0], "socks5://exit-b:1080",
+                         "static exits lead the order; the dynamic exit only backs them up")
+
+    def test_dynamic_exit_is_last_resort_when_static_fails(self):
+        POOL.mark_success("socks5://exit-b:1080")
+        POOL.mark_failure("socks5://exit-b:1080", "conn refused")
+        self.assertEqual(POOL.current(), "http://user:pass@127.0.0.1:2260",
+                         "with no healthy static exit left, rotation reaches the dynamic exit")
+        self.assertEqual(POOL.candidates()[-1], "http://user:pass@127.0.0.1:2260")
