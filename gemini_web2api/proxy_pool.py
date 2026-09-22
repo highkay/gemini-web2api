@@ -374,6 +374,9 @@ class ProxyPool:
             return nxt
 
     def status(self) -> dict:
+        # /status is the ops window onto this pool: pick up a state-file change here too,
+        # so a re-screened pool is visible without waiting for a chat request.
+        self._load_sticky()
         with self._lock:
             if not self._configured:
                 self.configure_from_config()

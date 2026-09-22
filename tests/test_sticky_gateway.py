@@ -150,6 +150,21 @@ class StickyWiringTest(unittest.TestCase):
         self.assertEqual(self._exit_urls(), STATICS)
         self.assertEqual(POOL.status()["sticky"]["active_total"], 0)
 
+    def test_status_reflects_a_state_change_without_a_chat_request(self):
+        write_state(self.state, {1: "active", 2: "active"})
+        self._enable()
+        self.assertEqual(POOL.status()["sticky"]["injected"], 2)
+
+        write_state(self.state, {1: "active", 2: "active", 3: "active"},
+                    mtime=self._tick + 10)
+        self._tick += 10
+
+        status = POOL.status()
+
+        self.assertEqual(status["sticky"]["injected"], 3,
+                         "/status is the ops window: it must show a freshly written pool")
+        self.assertEqual(len(status["exits"]), 5)
+
     def test_corrupt_state_file_keeps_the_working_slice(self):
         write_state(self.state, {1: "active", 2: "active"})
         self._enable()
