@@ -9,3 +9,4 @@ cookie.json
 gemini-auth.json
 
 .omo/
+config.json.bak*
