@@ -8,9 +8,13 @@ follow the sticky-pool contract:
 - ``block``     - BardErrorInfo[n], a captcha/sorry redirect, or an answer-less body
 - ``transport`` - tunnel/connection failure (no verdict about the egress IP)
 
-``read_timeout`` is deliberately tighter than the engine's: probes must fail fast
-so a screening pass fits in the caller's budget, and a healthy resin session
-answers in 5-6s (measured 2026-09-22).
+The read budget is deliberately *wider* than the gateway's per-attempt budget
+(25s vs 15s): every probe opens a cold tunnel, and cold resin sessions were
+measured answering at 20-21s while warm reuse of the same session answers in 3-9s
+(2026-09-23: 10 of 11 actives answered under a 40s budget, three of them just past
+the old 15s cap).  A production attempt that meets a cold session may still time
+out once -- the request then rotates to the next exit -- but the pool must not
+evict a session that is merely cold.
 """
 from __future__ import annotations
 
@@ -74,7 +78,7 @@ class GeminiStreamProber:
         prompt: str = "ping",
         model: str = None,
         connect_timeout: float = 8.0,
-        read_timeout: float = 15.0,
+        read_timeout: float = 25.0,
         write_timeout: float = 10.0,
         pool_timeout: float = 5.0,
     ):
