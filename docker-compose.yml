@@ -8,6 +8,11 @@ services:
       - "host.docker.internal:host-gateway"
     volumes:
       - ./config.json:/app/config.json
+      # 粘性池通用模块(热更源码,不动镜像)。挂包目录本身,容器内 `import sticky_pool`
+      # 才成立(挂上级目录会变成 namespace package)。
+      - /home/admin/sticky_pool/sticky_pool:/app/sticky_pool:ro
+      # 筛选状态:CLI(容器内)写、网关读、宿主 /home/admin/clashctl/var/sticky-pool 可见。
+      - /home/admin/clashctl/var/sticky-pool:/app/sticky-pool:rw
     networks:
       - default
     restart: always

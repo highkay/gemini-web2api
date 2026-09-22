@@ -45,6 +45,19 @@ def _client_key(proxy: Optional[str]) -> str:
     return proxy or "__direct__"
 
 
+def _proxy_read_timeout(proxy: Optional[str]) -> float:
+    """Read budget for one exit (httpx read = max gap between socket reads).
+
+    Sticky (dynamic) exits get the shorter budget: `_max_proxy_attempts` spends a
+    request's budget across a rotating screened set, and a screened resin session
+    answers in 5-6s (measured 2026-09-22), so waiting 30s on a dead one wastes the
+    attempts the pool was built to spend.  Static tunnels keep 30s: a
+    quiet-but-alive tunnel must not be cut short, and they fail fast anyway
+    (302 in ~2s when the IP is blocked).
+    """
+    return 15.0 if POOL.is_dynamic(proxy) else 30.0
+
+
 def _get_httpx_client(proxy: Optional[str] = None):
     """Get or create a per-proxy httpx client (supports socks5:// via socksio)."""
     global _httpx_lock
@@ -53,6 +66,10 @@ def _get_httpx_client(proxy: Optional[str] = None):
     if _httpx_lock is None:
         _httpx_lock = threading.Lock()
     key = _client_key(proxy)
+    # Resolve the read timeout *before* taking _httpx_lock: POOL.is_dynamic() needs
+    # POOL's lock, and POOL's failure path calls back into _reset_httpx_client() (which
+    # takes _httpx_lock).  Lock order is POOL -> _httpx, never the other way around.
+    read_timeout = _proxy_read_timeout(proxy)
     with _httpx_lock:
         client = _httpx_clients.get(key)
         if client is not None:
@@ -61,10 +78,12 @@ def _get_httpx_client(proxy: Optional[str] = None):
         # We disable auto-follow so we can detect block redirects cleanly.
         # Phase-scoped timeouts (2026-09-22): fail fast on tunnel/build errors and on
         # stalled responses so the retry chain rotates exits inside the caller's budget
-        # (httpx read = max gap between socket reads, not per-attempt total). Worst-case
-        # failing chain: 3 attempts × (5s connect + 30s read) + 2 × 2s delay = 109s
-        # ≤ 120s ANSWER_TIMEOUT_MS at :9010.
-        timeout = httpx.Timeout(connect=5.0, read=30.0, write=10.0, pool=5.0)
+        # (httpx read = max gap between socket reads, not per-attempt total).
+        # Observed failing chain with 2 static tunnels + 3 sticky exits:
+        # 2×2s + 3×(5s connect + 15s read) + 4×2s ≈ 72s ≤ 120s ANSWER_TIMEOUT_MS at :9010.
+        timeout = httpx.Timeout(
+            connect=5.0, read=read_timeout, write=10.0, pool=5.0
+        )
         if proxy:
             client = httpx.Client(
                 proxy=proxy,
@@ -121,6 +140,15 @@ def _reset_httpx_client(proxy: Optional[str]) -> None:
     timer = threading.Timer(30.0, _close)
     timer.daemon = True
     timer.start()
+
+
+def _evict_httpx_clients(proxies) -> None:
+    """Drop cached clients for exits that left the pool (called by ProxyPool)."""
+    for proxy in proxies:
+        _reset_httpx_client(proxy)
+
+
+POOL.set_client_evictor(_evict_httpx_clients)
 
 
 def _is_transport_error(exc: BaseException) -> bool:
@@ -308,6 +336,9 @@ def extract_response_text(raw: str) -> str:
 def _max_proxy_attempts() -> int:
     proxies = POOL.all_proxies()
     # Try each exit once per request, capped by retry_attempts * pool size.
+    # The sticky pool injects only a few screened exits (ProxyPool._load_sticky), which
+    # keeps this at 5 with the current 2 static tunnels -- the observed failing chain
+    # stays ~72s, and `retry_attempts` remains the floor.
     return max(CONFIG["retry_attempts"], len(proxies) if proxies else 1)
 
 

@@ -1,6 +1,8 @@
 """Proxy pool with health tracking, cooldown, and automatic rotation."""
 from __future__ import annotations
 
+import json
+import os
 import threading
 import time
 from typing import Any, Optional
@@ -38,6 +40,38 @@ def _proxy_label(proxy: Optional[str]) -> str:
     return proxy if proxy is not None else "direct"
 
 
+def _fresh_state() -> dict[str, Any]:
+    return {
+        "fails": 0,
+        "cooldown_until": 0.0,
+        "last_ok": 0.0,
+        "last_fail": 0.0,
+        "last_error": None,
+        "successes": 0,
+        "failures": 0,
+    }
+
+
+def _read_sticky_active_urls(state_path: str) -> Optional[list[str]]:
+    """Active session URLs from a sticky-pool state file; ``None`` = unreadable.
+
+    The sticky_pool module owns this format; the gateway reads only the two fields
+    it needs (``state``/``url``) so a missing or corrupt state file degrades to
+    statics-only instead of taking the gateway down.
+    """
+    try:
+        with open(state_path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        sessions = data.get("sessions") or []
+    except (OSError, ValueError, AttributeError, TypeError):
+        return None
+    urls = []
+    for session in sessions:
+        if isinstance(session, dict) and session.get("state") == "active" and session.get("url"):
+            urls.append(str(session["url"]))
+    return urls
+
+
 class ProxyPool:
     """Thread-safe sticky proxy selection with failure-driven rotation."""
 
@@ -48,6 +82,26 @@ class ProxyPool:
         self._current: Optional[str] = None
         self._configured = False
         self._dynamic_exits: set = set()
+        self._config_dynamic_exits: set = set()
+        # Screened sticky pool (see _load_sticky): the CLI re-screens resin-style
+        # sessions and publishes the handout-able ones; the gateway injects a
+        # rotating slice of them as dynamic exits whenever the file changes.
+        self._sticky_cfg: dict = {}
+        self._sticky_urls: list[str] = []
+        self._sticky_active_total = 0
+        self._sticky_offset = 0
+        self._sticky_state_mtime = 0.0
+        self._client_evictor = None
+
+    def set_client_evictor(self, fn) -> None:
+        """Register ``fn([url, ...])``: close cached clients for retired exits.
+
+        Called with POOL's lock held, so ``fn`` may only take locks that are never
+        taken while reaching for POOL's lock.  gemini.py's evictor takes the httpx
+        client lock, and the holder of that lock resolves its timeouts before
+        acquiring it -- keep that order (POOL -> _httpx, never the reverse).
+        """
+        self._client_evictor = fn
 
     def configure_from_config(self) -> None:
         """Load proxy list from CONFIG. Safe to call multiple times."""
@@ -74,21 +128,11 @@ class ProxyPool:
         with self._lock:
             old_current = self._current
             self._proxies = ordered
-            self._state = {
-                p: self._state.get(p) or {
-                    "fails": 0,
-                    "cooldown_until": 0.0,
-                    "last_ok": 0.0,
-                    "last_fail": 0.0,
-                    "last_error": None,
-                    "successes": 0,
-                    "failures": 0,
-                }
-                for p in ordered
-            }
+            self._state = {p: self._state.get(p) or _fresh_state() for p in ordered}
             self._dynamic_exits = {
                 _normalize_proxy(p) for p in (rotate.get("dynamic_exits") or [])
             }
+            self._config_dynamic_exits = set(self._dynamic_exits)
             # Dynamic exits (per-request IP rotation) are a last-resort layer, never a
             # place to pin the pool: a single fallback to one of them must not make every
             # later request lead with it (2026-09-22).
@@ -104,15 +148,102 @@ class ProxyPool:
                 "fail_threshold": int(rotate.get("fail_threshold", 1)),
                 "probe_on_start": bool(rotate.get("probe_on_start", False)),
             }
+            sticky_cfg = CONFIG.get("sticky_pool")
+            self._sticky_cfg = dict(sticky_cfg) if isinstance(sticky_cfg, dict) else {}
+            self._sticky_urls = []
+            self._sticky_active_total = 0
+            self._sticky_offset = 0
+            self._sticky_state_mtime = 0.0
 
         labels = ", ".join(_proxy_label(p) for p in ordered) or "direct"
         log(f"Proxy pool: {len(ordered)} exit(s) [{labels}] current={_proxy_label(self._current)}")
+        if self._sticky_cfg.get("enabled"):
+            self._load_sticky(force=True)
 
     def enabled(self) -> bool:
         with self._lock:
             if not self._configured:
                 self.configure_from_config()
             return bool(self._rotate_cfg.get("enabled", True)) and len(self._proxies) > 1
+
+    def _load_sticky(self, force: bool = False) -> bool:
+        """Inject the screened sticky sessions published by the sticky-pool CLI.
+
+        Only ``max_dynamic_exits`` of the file's active sessions are injected and the
+        slice rotates on every reload: ``_max_proxy_attempts()`` is
+        ``max(retry_attempts, len(_proxies))``, so every injected URL adds another
+        attempt to a failing request.  With 2 static tunnels + 3 sticky exits the
+        observed failure chain is ~72s, inside the 120s caller budget at :9010;
+        injecting all ~20 screened sessions would put a failing request over 6 minutes.
+
+        Cheap and safe to call per request: it is a stat() plus an mtime compare, and
+        it changes nothing until the CLI writes a new state file.
+        """
+        cfg = self._sticky_cfg
+        if not cfg.get("enabled"):
+            return False
+        state_path = cfg.get("state_path")
+        if not state_path:
+            return False
+        try:
+            mtime = os.stat(state_path).st_mtime
+        except OSError:
+            return False  # before the first `init`: statics-only, nothing to change
+
+        with self._lock:
+            if not force and mtime == self._sticky_state_mtime:
+                return False
+            self._sticky_state_mtime = mtime
+            active_urls = _read_sticky_active_urls(state_path)
+            if active_urls is None:
+                log(f"Sticky pool: {state_path} unreadable; keeping current exits")
+                return False
+
+            max_dynamic = max(1, int(cfg.get("max_dynamic_exits", 3)))
+            if len(active_urls) > max_dynamic:
+                offset = self._sticky_offset % len(active_urls)
+                urls = (active_urls[offset:] + active_urls[:offset])[:max_dynamic]
+                self._sticky_offset = (offset + len(urls)) % len(active_urls)
+            else:
+                urls = active_urls
+                self._sticky_offset = 0
+
+            previous_dynamic = set(self._dynamic_exits)
+            statics = [p for p in self._proxies if p not in previous_dynamic]
+            self._dynamic_exits = set(self._config_dynamic_exits) | set(urls)
+            # Replace (never append) the dynamic slice: this runs on every file change,
+            # so appending would grow _proxies -- and the attempt budget -- forever.
+            self._proxies = statics + [p for p in urls if p not in statics]
+            self._sticky_urls = list(urls)
+            self._sticky_active_total = len(active_urls)
+            for proxy in self._proxies:
+                self._state.setdefault(proxy, _fresh_state())
+            # Exits that left the pool must not keep counters around: /status and the
+            # cooldown accounting read exactly this map.
+            for proxy in [p for p in self._state if p not in self._proxies]:
+                self._state.pop(proxy, None)
+            static_ordered = [p for p in self._proxies if p not in self._dynamic_exits]
+            if self._current not in self._proxies or self._current in self._dynamic_exits:
+                self._current = (static_ordered or self._proxies or [None])[0]
+            retired = sorted(p for p in previous_dynamic - self._dynamic_exits if p)
+
+        if retired and self._client_evictor is not None:
+            try:
+                self._client_evictor(retired)
+            except Exception:  # pragma: no cover - eviction must never break a request
+                pass
+        log(
+            f"Sticky pool: {len(urls)} exit(s) injected of {len(active_urls)} active "
+            f"[{', '.join(_proxy_label(p) for p in urls) or 'none'}]"
+        )
+        return True
+
+    def is_dynamic(self, proxy: Optional[str]) -> bool:
+        """True for per-request-rotating exits (screened sticky pool or config)."""
+        with self._lock:
+            if not self._configured:
+                self.configure_from_config()
+            return proxy in self._dynamic_exits
 
     def current(self) -> Optional[str]:
         with self._lock:
@@ -140,6 +271,8 @@ class ProxyPool:
 
     def candidates(self, max_n: Optional[int] = None) -> list[Optional[str]]:
         """Return preferred proxy order: sticky current first, then other healthy, then cooled-down."""
+        # Pick up a freshly screened sticky pool within one request of the CLI writing it.
+        self._load_sticky()
         with self._lock:
             if not self._configured:
                 self.configure_from_config()
@@ -246,6 +379,7 @@ class ProxyPool:
                 self.configure_from_config()
             now = time.time()
             exits = []
+            sticky_urls = set(self._sticky_urls)
             for p in self._proxies:
                 st = self._state.get(p) or {}
                 cd = float(st.get("cooldown_until") or 0)
@@ -260,6 +394,8 @@ class ProxyPool:
                     "last_fail": st.get("last_fail") or None,
                     "last_error": st.get("last_error"),
                     "current": p == self._current,
+                    "dynamic": p in self._dynamic_exits,
+                    "sticky": p in sticky_urls,
                 })
             return {
                 "enabled": bool(self._rotate_cfg.get("enabled", True)),
@@ -267,6 +403,14 @@ class ProxyPool:
                 "fail_threshold": self._fail_threshold(),
                 "current": _proxy_label(self._current),
                 "exits": exits,
+                "sticky": {
+                    "enabled": bool(self._sticky_cfg.get("enabled")),
+                    "state_path": self._sticky_cfg.get("state_path"),
+                    "state_mtime": self._sticky_state_mtime or None,
+                    "max_dynamic_exits": self._sticky_cfg.get("max_dynamic_exits"),
+                    "injected": len(self._sticky_urls),
+                    "active_total": self._sticky_active_total,
+                },
             }
 
 
