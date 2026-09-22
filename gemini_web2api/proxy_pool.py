@@ -52,12 +52,12 @@ def _fresh_state() -> dict[str, Any]:
     }
 
 
-def _read_sticky_active_urls(state_path: str) -> Optional[list[str]]:
-    """Active session URLs from a sticky-pool state file; ``None`` = unreadable.
+def _read_sticky_active_urls(state_path: str) -> Optional[list[tuple[str, str]]]:
+    """``[(url, egress_ip), ...]`` for the active sessions; ``None`` = unreadable.
 
-    The sticky_pool module owns this format; the gateway reads only the two fields
-    it needs (``state``/``url``) so a missing or corrupt state file degrades to
-    statics-only instead of taking the gateway down.
+    The sticky_pool module owns this format; the gateway reads only the fields it needs
+    so a missing or corrupt state file degrades to statics-only instead of taking the
+    gateway down.
     """
     try:
         with open(state_path, "r", encoding="utf-8") as fh:
@@ -65,11 +65,37 @@ def _read_sticky_active_urls(state_path: str) -> Optional[list[str]]:
         sessions = data.get("sessions") or []
     except (OSError, ValueError, AttributeError, TypeError):
         return None
-    urls = []
+    active = []
     for session in sessions:
         if isinstance(session, dict) and session.get("state") == "active" and session.get("url"):
-            urls.append(str(session["url"]))
-    return urls
+            active.append((str(session["url"]), str(session.get("egress_ip") or "")))
+    return active
+
+
+def _prefer_distinct_ips(entries: list[tuple[str, str]], count: int) -> list[str]:
+    """Pick ``count`` URLs, preferring one per egress IP (then backfilling).
+
+    Sticky sessions can share an egress IP (two sessions behind one flagged exit), and
+    a slice that spends two of five attempts on the same IP gets one draw, not two.
+    ``egress_ip`` is only as fresh as the last screen, so this is a preference: the
+    backfill keeps the slice at full size and never drops a usable session.
+    """
+    picked: list[str] = []
+    seen_ips: set[str] = set()
+    for url, ip in entries:
+        if ip and ip in seen_ips:
+            continue
+        if ip:
+            seen_ips.add(ip)
+        picked.append(url)
+        if len(picked) >= count:
+            return picked
+    for url, _ip in entries:
+        if url not in picked:
+            picked.append(url)
+            if len(picked) >= count:
+                break
+    return picked
 
 
 class ProxyPool:
@@ -83,6 +109,7 @@ class ProxyPool:
         self._configured = False
         self._dynamic_exits: set = set()
         self._config_dynamic_exits: set = set()
+        self._config_dynamic_list: list = []
         # Screened sticky pool (see _load_sticky): the CLI re-screens resin-style
         # sessions and publishes the handout-able ones; the gateway injects a
         # rotating slice of them as dynamic exits whenever the file changes.
@@ -133,6 +160,10 @@ class ProxyPool:
                 _normalize_proxy(p) for p in (rotate.get("dynamic_exits") or [])
             }
             self._config_dynamic_exits = set(self._dynamic_exits)
+            self._config_dynamic_list = [
+                _normalize_proxy(p) for p in (rotate.get("dynamic_exits") or [])
+                if _normalize_proxy(p)
+            ]
             # Dynamic exits (per-request IP rotation) are a last-resort layer, never a
             # place to pin the pool: a single fallback to one of them must not make every
             # later request lead with it (2026-09-22).
@@ -194,28 +225,32 @@ class ProxyPool:
             if not force and mtime == self._sticky_state_mtime:
                 return False
             self._sticky_state_mtime = mtime
-            active_urls = _read_sticky_active_urls(state_path)
-            if active_urls is None:
+            active_entries = _read_sticky_active_urls(state_path)
+            if active_entries is None:
                 log(f"Sticky pool: {state_path} unreadable; keeping current exits")
                 return False
 
             max_dynamic = max(1, int(cfg.get("max_dynamic_exits", 3)))
-            if len(active_urls) > max_dynamic:
-                offset = self._sticky_offset % len(active_urls)
-                urls = (active_urls[offset:] + active_urls[:offset])[:max_dynamic]
-                self._sticky_offset = (offset + len(urls)) % len(active_urls)
+            if len(active_entries) > max_dynamic:
+                offset = self._sticky_offset % len(active_entries)
+                rotated = active_entries[offset:] + active_entries[:offset]
+                urls = _prefer_distinct_ips(rotated, max_dynamic)
+                self._sticky_offset = (offset + max_dynamic) % len(active_entries)
             else:
-                urls = active_urls
+                urls = _prefer_distinct_ips(active_entries, max_dynamic)
                 self._sticky_offset = 0
 
             previous_dynamic = set(self._dynamic_exits)
             statics = [p for p in self._proxies if p not in previous_dynamic]
             self._dynamic_exits = set(self._config_dynamic_exits) | set(urls)
-            # Replace (never append) the dynamic slice: this runs on every file change,
-            # so appending would grow _proxies -- and the attempt budget -- forever.
-            self._proxies = statics + [p for p in urls if p not in statics]
+            # Replace (never append) the sticky slice, but keep config-declared dynamic
+            # exits: this runs on every file change, so appending would grow _proxies --
+            # and the attempt budget -- forever.
+            self._proxies = statics + [
+                p for p in self._config_dynamic_list if p not in statics
+            ] + [p for p in urls if p not in statics and p not in self._config_dynamic_exits]
             self._sticky_urls = list(urls)
-            self._sticky_active_total = len(active_urls)
+            self._sticky_active_total = len(active_entries)
             for proxy in self._proxies:
                 self._state.setdefault(proxy, _fresh_state())
             # Exits that left the pool must not keep counters around: /status and the
@@ -233,7 +268,7 @@ class ProxyPool:
             except Exception:  # pragma: no cover - eviction must never break a request
                 pass
         log(
-            f"Sticky pool: {len(urls)} exit(s) injected of {len(active_urls)} active "
+            f"Sticky pool: {len(urls)} exit(s) injected of {len(active_entries)} active "
             f"[{', '.join(_proxy_label(p) for p in urls) or 'none'}]"
         )
         return True

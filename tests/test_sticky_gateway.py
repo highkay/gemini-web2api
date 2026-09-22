@@ -32,11 +32,11 @@ def sticky_url(n):
     return f"http://Default.wt22.user{n}:pw@192.168.1.18:2260"
 
 
-def write_state(path, states, mtime=None):
+def write_state(path, states, mtime=None, ips=None):
     """states: {n: state}.  mtime forces a distinct mtime (reload key)."""
     sessions = [
         {"n": n, "url": sticky_url(n), "state": state, "last_ok": 1.0, "last_check": 1.0,
-         "consecutive_fails": 0, "egress_ip": "", "last_used": 0.0}
+         "consecutive_fails": 0, "egress_ip": (ips or {}).get(n, ""), "last_used": 0.0}
         for n, state in sorted(states.items())
     ]
     with open(path, "w") as fh:
@@ -144,6 +144,40 @@ class StickyWiringTest(unittest.TestCase):
 
         self.assertEqual(self._exit_urls(), STATICS)
         self.assertEqual(POOL.status()["sticky"]["injected"], 0)
+
+    def test_slice_prefers_distinct_egress_ips(self):
+        write_state(self.state, {1: "active", 2: "active", 3: "active", 4: "active"},
+                    ips={1: "203.0.113.1", 2: "203.0.113.1", 3: "203.0.113.2",
+                         4: "203.0.113.3"})
+        self._enable()
+
+        self.assertEqual([u for u in self._exit_urls() if u not in STATICS],
+                         [sticky_url(1), sticky_url(3), sticky_url(4)],
+                         "two sessions behind one egress IP must not take two attempt slots")
+
+    def test_slice_backfills_when_ips_cannot_be_diversified(self):
+        write_state(self.state, {1: "active", 2: "active", 3: "active"},
+                    ips={1: "203.0.113.9", 2: "203.0.113.9", 3: "203.0.113.9"})
+        self._enable()
+
+        self.assertEqual(len([u for u in self._exit_urls() if u not in STATICS]), 3,
+                         "a shared egress IP is a preference, not a reason to shrink the slice")
+
+    def test_config_dynamic_exits_survive_sticky_reloads(self):
+        legacy = "http://legacy:pass@127.0.0.1:2260"
+        CONFIG["proxies"] = list(STATICS) + [legacy]
+        CONFIG["proxy_rotate"]["dynamic_exits"] = [legacy]
+        write_state(self.state, {1: "active", 2: "active"})
+        self._enable()
+
+        self.assertIn(legacy, self._exit_urls())
+        self.assertTrue(POOL.is_dynamic(legacy))
+
+        self._reload()
+
+        self.assertIn(legacy, self._exit_urls(),
+                      "a config-declared dynamic exit must not be dropped by the sticky slice")
+        self.assertIn(legacy, POOL.candidates())
 
     def test_missing_state_file_keeps_the_statics_only(self):
         self._enable()
