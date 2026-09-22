@@ -10,10 +10,13 @@ services:
       - ./config.json:/app/config.json
     networks:
       - default
-      - warp-plus
     restart: always
 
 networks:
-  warp-plus:
-    external: true
-    name: warp-plus_default
+  default:
+    # 保留固定网络名:容器 IP 落在 192.168.112.0/20,网关代理 URL 依赖它访问宿主 mihomo
+    # (socks5://192.168.112.1:7890|7892)。
+    name: gemini-web2api_default
+    # 曾经的 warp-plus 外部网络已不存在(2026-09-22 `docker network ls` 无任何 warp* 网络),
+    # 容器一直只跑在 default 上;保留该引用会让 `docker compose up` 报
+    # "network warp-plus_default declared as external, but could not be found" 直接失败。
