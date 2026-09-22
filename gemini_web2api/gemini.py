@@ -59,7 +59,10 @@ def _get_httpx_client(proxy: Optional[str] = None):
             return client
         # Follow redirects only for non-API pages; StreamGenerate captcha is 302.
         # We disable auto-follow so we can detect block redirects cleanly.
-        timeout = CONFIG["request_timeout_sec"]
+        # Phase-scoped timeouts (2026-09-22): fail fast on tunnel/build errors and on
+        # hung responses so the retry chain can rotate exits inside the caller's budget
+        # (4 attempts × 25s + 3×2s delay ≈ 106s ≤ 120s ANSWER_TIMEOUT_MS at :9010).
+        timeout = httpx.Timeout(connect=5.0, read=20.0, write=10.0, pool=5.0)
         if proxy:
             client = httpx.Client(
                 proxy=proxy,
@@ -86,6 +89,33 @@ def reset_httpx_clients():
         except Exception:
             pass
     _httpx_clients = {}
+
+
+def _reset_httpx_client(proxy: Optional[str]) -> None:
+    """Drop one cached httpx client so the next retry opens a fresh tunnel.
+
+    Kills the stale keep-alive connections that cause SSL UNEXPECTED_EOF on the
+    alternate exit after a failed attempt (2026-09-22).
+    """
+    global _httpx_clients, _httpx_lock
+    if not HAS_HTTPX:
+        return
+    if _httpx_lock is None:
+        import threading
+        _httpx_lock = threading.Lock()
+    key = _client_key(proxy)
+    with _httpx_lock:
+        client = _httpx_clients.pop(key, None)
+    if client is not None:
+        try:
+            client.close()
+        except Exception:
+            pass
+
+
+def _is_transport_error(exc: BaseException) -> bool:
+    """True for connection/TLS/read failures (as opposed to block or Bard errors)."""
+    return bool(HAS_HTTPX) and isinstance(exc, httpx.TransportError)
 
 
 def load_cookie() -> tuple:
@@ -370,6 +400,8 @@ def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None
         except Exception as e:
             last_err = e
             reason = error_reason(e)
+            if _is_transport_error(e):
+                _reset_httpx_client(proxy)
             POOL.mark_failure(proxy, reason, force_rotate=True)
             log(f"Retry {attempt+1}/{attempts} via {label}: {e}")
             if attempt < attempts - 1:
@@ -452,6 +484,8 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
         except Exception as e:
             last_err = e
             reason = error_reason(e)
+            if _is_transport_error(e):
+                _reset_httpx_client(proxy)
             if is_block_error(e):
                 POOL.mark_failure(proxy, reason, force_rotate=True)
                 log(f"Stream block-like via {label}: {reason}")
