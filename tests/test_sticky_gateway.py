@@ -317,12 +317,11 @@ class ProberTest(unittest.TestCase):
         self.assertEqual(result.signature, "transport")
         self.assertIn("http=502", result.detail)
 
-    def test_probe_budget_covers_a_cold_tunnel_but_not_a_hang(self):
+    def test_probe_budget_mirrors_production(self):
+        """A probe that waits longer than production keeps sessions production can't use."""
         prober = GeminiStreamProber()
         self.assertEqual(prober.timeout.connect, 8.0)
-        self.assertEqual(prober.timeout.read, 25.0,
-                         "probes open a cold tunnel; sessions measured answering at 20-21s "
-                         "must not be evicted as dead")
+        self.assertEqual(prober.timeout.read, 15.0)
 
 
 if __name__ == "__main__":
