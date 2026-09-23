@@ -112,13 +112,19 @@ def reset_httpx_clients():
     _httpx_clients = {}
 
 
-def _reset_httpx_client(proxy: Optional[str]) -> None:
+def _reset_httpx_client(proxy: Optional[str], close_after: float = 30.0) -> None:
     """Evict one cached httpx client so the next retry opens a fresh tunnel.
 
     The client is popped from the cache at once (the retrying request builds a fresh
     tunnel, killing the stale keep-alive connections behind SSL UNEXPECTED_EOF), but
-    closed on a short timer: closing inline would tear down connections that concurrent
+    closed on a timer: closing inline would tear down connections that concurrent
     requests are still streaming on (2026-09-22).
+
+    ``close_after`` must outlive the longest request that may still be using the client:
+    httpcore's ``ConnectionPool.close()`` closes *every* pooled connection (no idle
+    check) and ``HTTP11Connection.close()`` unilaterally closes the socket, so a short
+    timer truncates an in-flight stream mid-response.  Verified in the installed
+    httpcore 2026-09-23.
     """
     global _httpx_clients, _httpx_lock
     if not HAS_HTTPX:
@@ -137,15 +143,27 @@ def _reset_httpx_client(proxy: Optional[str]) -> None:
         except Exception:
             pass
 
-    timer = threading.Timer(30.0, _close)
+    timer = threading.Timer(close_after, _close)
     timer.daemon = True
     timer.start()
 
 
+#: Lease for clients retired by pool rotation (not by an error).  Rotation happens every
+#: refresh cycle (~180s) while requests may still be streaming through a retired exit,
+#: and the caller's answer budget at :9010 is 120s -- hanging up earlier would truncate a
+#: live answer (`Gemini stream content changed during retry` on the caller side).
+_ROTATION_CLIENT_LEASE_SEC = 150.0
+
+
 def _evict_httpx_clients(proxies) -> None:
-    """Drop cached clients for exits that left the pool (called by ProxyPool)."""
+    """Drop cached clients for exits that left the pool (called by ProxyPool).
+
+    Uses the long lease: these exits were healthy a moment ago (rotation retires them on
+    every state reload), unlike the error path, which evicts a client whose tunnel just
+    failed and can hang up quickly.
+    """
     for proxy in proxies:
-        _reset_httpx_client(proxy)
+        _reset_httpx_client(proxy, close_after=_ROTATION_CLIENT_LEASE_SEC)
 
 
 POOL.set_client_evictor(_evict_httpx_clients)

@@ -179,6 +179,50 @@ class StickyWiringTest(unittest.TestCase):
                       "a config-declared dynamic exit must not be dropped by the sticky slice")
         self.assertIn(legacy, POOL.candidates())
 
+    def test_missing_state_file_warns_once_that_the_pool_is_idle(self):
+        """A dropped compose volume must not look like a healthy statics-only gateway."""
+        import io
+        from contextlib import redirect_stderr
+
+        buf = io.StringIO()
+        with redirect_stderr(buf):
+            self._enable()          # state file does not exist
+            POOL.status()
+            POOL.candidates()
+
+        warnings = [line for line in buf.getvalue().splitlines() if "absent" in line]
+        self.assertEqual(len(warnings), 1, f"expected exactly one startup warning: {buf.getvalue()}")
+
+    def test_rotation_retires_clients_after_the_caller_budget(self):
+        """Rotation must not hang up on a stream that is still being streamed out."""
+        import unittest.mock as mock
+
+        from gemini_web2api import gemini
+
+        delays = []
+
+        class Recorder:
+            def __init__(self, delay, fn):
+                delays.append(delay)
+
+            def start(self):
+                pass
+
+        class DummyClient:
+            def close(self):
+                pass
+
+        url = sticky_url(1)
+        gemini._httpx_clients[gemini._client_key(url)] = DummyClient()
+        with mock.patch.object(gemini.threading, "Timer", Recorder):
+            gemini._evict_httpx_clients([url])
+
+        self.assertEqual(len(delays), 1)
+        self.assertGreaterEqual(delays[0], 120.0,
+                                "the retired client's socket must outlive the 120s caller budget")
+        self.assertNotIn(gemini._client_key(url), gemini._httpx_clients,
+                         "the cache pop is what gives the next retry a fresh tunnel")
+
     def test_missing_state_file_keeps_the_statics_only(self):
         self._enable()
         self.assertEqual(self._exit_urls(), STATICS)

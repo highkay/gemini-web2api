@@ -118,6 +118,7 @@ class ProxyPool:
         self._sticky_active_total = 0
         self._sticky_offset = 0
         self._sticky_state_mtime = 0.0
+        self._sticky_missing_warned = False
         self._client_evictor = None
 
     def set_client_evictor(self, fn) -> None:
@@ -185,6 +186,7 @@ class ProxyPool:
             self._sticky_active_total = 0
             self._sticky_offset = 0
             self._sticky_state_mtime = 0.0
+            self._sticky_missing_warned = False
 
         labels = ", ".join(_proxy_label(p) for p in ordered) or "direct"
         log(f"Proxy pool: {len(ordered)} exit(s) [{labels}] current={_proxy_label(self._current)}")
@@ -219,7 +221,11 @@ class ProxyPool:
         try:
             mtime = os.stat(state_path).st_mtime
         except OSError:
-            return False  # before the first `init`: statics-only, nothing to change
+            # Self-announcing failure: an enabled sticky pool with no state file means a
+            # dropped compose volume or a missing `init`, and the gateway would otherwise
+            # quietly serve statics-only (2026-09-23).
+            self._warn_missing_sticky(state_path)
+            return False
 
         with self._lock:
             if not force and mtime == self._sticky_state_mtime:
@@ -279,6 +285,17 @@ class ProxyPool:
             if not self._configured:
                 self.configure_from_config()
             return proxy in self._dynamic_exits
+
+    def _warn_missing_sticky(self, state_path: str) -> None:
+        """Log once that an enabled sticky pool has no state file to hand out."""
+        with self._lock:
+            if self._sticky_missing_warned:
+                return
+            self._sticky_missing_warned = True
+        log(
+            f"Sticky pool: enabled but {state_path} is absent -- serving statics-only "
+            f"(check the compose volume mount and run `python -m sticky_pool init`)"
+        )
 
     def current(self) -> Optional[str]:
         with self._lock:
