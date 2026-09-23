@@ -193,8 +193,13 @@ class StickyWiringTest(unittest.TestCase):
         warnings = [line for line in buf.getvalue().splitlines() if "absent" in line]
         self.assertEqual(len(warnings), 1, f"expected exactly one startup warning: {buf.getvalue()}")
 
-    def test_rotation_retires_clients_after_the_caller_budget(self):
-        """Rotation must not hang up on a stream that is still being streamed out."""
+    def test_rotation_retires_clients_after_a_stream_sized_lease(self):
+        """Rotation must not hang up on a stream a slow consumer is still reading.
+
+        generate_stream yields from inside ``with client.stream(...)`` and the SSE path has
+        no idle cap, so the lease is sized from lingering clients (<=3 retirements per
+        ~180s reload), not from the 120s answer budget.
+        """
         import unittest.mock as mock
 
         from gemini_web2api import gemini
@@ -218,8 +223,8 @@ class StickyWiringTest(unittest.TestCase):
             gemini._evict_httpx_clients([url])
 
         self.assertEqual(len(delays), 1)
-        self.assertGreaterEqual(delays[0], 120.0,
-                                "the retired client's socket must outlive the 120s caller budget")
+        self.assertGreaterEqual(delays[0], 300.0,
+                                "a retired client's socket must outlive a slow streaming consumer")
         self.assertNotIn(gemini._client_key(url), gemini._httpx_clients,
                          "the cache pop is what gives the next retry a fresh tunnel")
 

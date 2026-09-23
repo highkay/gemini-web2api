@@ -148,11 +148,19 @@ def _reset_httpx_client(proxy: Optional[str], close_after: float = 30.0) -> None
     timer.start()
 
 
-#: Lease for clients retired by pool rotation (not by an error).  Rotation happens every
-#: refresh cycle (~180s) while requests may still be streaming through a retired exit,
-#: and the caller's answer budget at :9010 is 120s -- hanging up earlier would truncate a
-#: live answer (`Gemini stream content changed during retry` on the caller side).
-_ROTATION_CLIENT_LEASE_SEC = 150.0
+#: Lease for clients retired by pool rotation (not by an error).
+#:
+#: Rotation retires up to ``max_dynamic_exits`` exits on *every* state reload (the refresh
+#: timer rewrites the file every ~180s) and those exits were healthy, so a stream may still
+#: be running through them.  ``generate_stream`` yields from inside
+#: ``with client.stream(...)`` and the SSE path has no server-side idle cap, so a slow
+#: downstream consumer can hold such a client open for a long time -- the lease must be
+#: sized from that bound, not from the 120s answer budget.
+#:
+#: 300s is safe *and* bounded: <=3 clients are retired per reload, so at most ~8 clients
+#: linger at any moment (negligible), and the cache pop -- not the delayed close -- is what
+#: gives the next retry a fresh tunnel.  150s was tried first and still cut slow streams.
+_ROTATION_CLIENT_LEASE_SEC = 300.0
 
 
 def _evict_httpx_clients(proxies) -> None:
